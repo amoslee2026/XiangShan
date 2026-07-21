@@ -531,6 +531,11 @@ class MemBlockInlinedImp(outer: MemBlockInlined) extends LazyModuleImp(outer)
   newLoadUnits.zipWithIndex.map(x => x._1.suggestName("LoadUnit_"+x._2))
   storeUnits.zipWithIndex.map(x => x._1.suggestName("StoreUnit_"+x._2))
 
+  for (i <- 0 until LoadEntrance.num) {
+    val sourceName = LoadEntrance.findNameById(i)
+    val eventCount = PopCount(newLoadUnits.map(_.io.sourceExecuteFailRobHead(i)))
+    XSPerfAccumulate(s"${sourceName}_execute_fail_rob_head", eventCount)
+  }
 
   writebackLda.zipWithIndex.foreach { case (wb, i) =>
     if (i == AtomicWBPort) {
@@ -872,7 +877,11 @@ class MemBlockInlinedImp(outer: MemBlockInlined) extends LazyModuleImp(outer)
   // LoadUnit
   for (i <- 0 until LduCnt) {
     newLoadUnits(i).io.redirect <> redirect
+<<<<<<< HEAD
     rrBankConflictFastReplay(i).grant := rrBankConflictFastReplayGrant(i)
+=======
+    newLoadUnits(i).io.perfRobHeadPtr := io.ooo_to_mem.lsqio.pendingPtrNext
+>>>>>>> 120e91baa (perf(LoadUnit): add perfCounter of load execute)
 
     // get input form dispatch
     newLoadUnits(i).io.ldin <> issueLda(i)

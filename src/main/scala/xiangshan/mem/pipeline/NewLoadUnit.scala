@@ -1264,6 +1264,7 @@ class LoadUnitS3(param: ExeUnitParams)(
     val redirect = Flipped(ValidIO(new Redirect))
     val kill = Input(Bool())
     val unalignTailValid = Input(Bool())
+    val perfRobHeadPtr = Input(new RobPtr)
 
     // DCache response
     val dcacheError = Input(Bool())
@@ -1305,6 +1306,8 @@ class LoadUnitS3(param: ExeUnitParams)(
     val perfLqHeadPtr = Input(new LqPtr)
     val perfLqFull = Input(Bool())
     val perfMdpAddr = Output(new PerfMdpAddr)
+    // ROB-head source execute-fail events
+    val sourceExecuteFailRobHead = Output(LoadEntrance())
 
     // CSR control signals
     val csrCtrl = Flipped(new CustomCSRCtrlIO)
@@ -1375,6 +1378,12 @@ class LoadUnitS3(param: ExeUnitParams)(
   val s4HeadCacheMiss = s4Head.cause.get(C_DM)
   val s4HeadMshrId    = s4Head.mshrId.get
   val s4HeadHandledByMSHR = s4Head.handledByMSHR.get
+
+  val perfOutcomeUop = Mux(s4HeadValid, s4Head.uop, uop)
+  val perfOutcomeHasROBEntry = Mux(s4HeadValid, s4Head.hasROBEntry, in.hasROBEntry)
+  val perfOutcomeKill = io.kill || perfOutcomeUop.robIdx.needFlush(redirect)
+  val perfAtRobHead = pipeIn.valid && !perfOutcomeKill && perfOutcomeHasROBEntry &&
+    perfOutcomeUop.robIdx === io.perfRobHeadPtr
 
   val vaddr = Mux(s4HeadValid, s4HeadVAddr, in.vaddr)
   val paddr = Mux(s4HeadValid, s4HeadPAddr, in.paddr.get)
@@ -1741,6 +1750,15 @@ class LoadUnitS3(param: ExeUnitParams)(
   val executeFail = lqWriteValid && lqWriteCause.asUInt.orR || pipeIn.valid && shouldFastReplay
   // fastReplay's entrance maybe not one-hot.
   val perfEntrance = Mux((pipeIn.bits.entrance & LoadEntrance.fastReplay.U).orR, LoadEntrance.fastReplay.U, pipeIn.bits.entrance)
+
+  val sourceExecuteFailRobHead = Mux(perfAtRobHead && executeFail, perfEntrance, 0.U)
+  io.sourceExecuteFailRobHead := sourceExecuteFailRobHead
+
+  for (i <- 0 until LoadEntrance.num) {
+    val sourceName = LoadEntrance.findNameById(i)
+    XSPerfAccumulate(s"${sourceName}_execute_fail_rob_head", sourceExecuteFailRobHead(i))
+  }
+
   for (i <- 0 until LoadEntrance.num) {
     val highPrioNume = LoadEntrance.findNameById(i)
     for (j <- i + 1 until LoadEntrance.num) {
@@ -1922,6 +1940,7 @@ class LoadUnitDataPath(val param: ExeUnitParams)(implicit p: Parameters) extends
 class LoadUnitIO(val param: ExeUnitParams)(implicit p: Parameters) extends XSBundle {
   private val numMemChannels = p(XSCoreParamsKey).dcacheParametersOpt.get.numMemChannels
   val redirect = Flipped(ValidIO(new Redirect))
+  val perfRobHeadPtr = Input(new RobPtr)
   // Request sources
   val ldin = Flipped(DecoupledIO(new ExuInput(param, hasCopySrc = true)))
   val vecldin = Flipped(DecoupledIO(new VectorLoadIn))
@@ -1973,6 +1992,8 @@ class LoadUnitIO(val param: ExeUnitParams)(implicit p: Parameters) extends XSBun
   // Debug info and top-down info
   val debugInfo = Output(new DebugLsInfoBundle)
   val topDownInfo = Output(new LsTopdownInfo)
+  // ROB-head source execute-fail events for MemBlock aggregation
+  val sourceExecuteFailRobHead = Output(LoadEntrance())
 }
 
 class NewLoadUnit(val param: ExeUnitParams)(implicit p: Parameters) extends XSModule with HasPerfEvents {
@@ -2079,6 +2100,7 @@ class NewLoadUnit(val param: ExeUnitParams)(implicit p: Parameters) extends XSMo
 
   // S3
   s3.io.redirect := io.redirect
+  s3.io.perfRobHeadPtr := io.perfRobHeadPtr
   s3.io.dcacheError := io.dcache.resp.bits.error_delayed
   io.ldout <> s3.io.ldout
   io.lqWrite <> s3.io.lqWrite
@@ -2095,6 +2117,7 @@ class NewLoadUnit(val param: ExeUnitParams)(implicit p: Parameters) extends XSMo
   s3.io.perfLqFull := io.perfLqFull
   io.perfMdpAddr := s3.io.perfMdpAddr
   io.exceptionInfo := s3.io.exceptionInfo
+  io.sourceExecuteFailRobHead := s3.io.sourceExecuteFailRobHead
   s3.io.csrCtrl := io.csrCtrl
 
   // Data path
@@ -2245,6 +2268,8 @@ class NewLoadUnitTop(implicit val p: Parameters) extends Module
   with HasMemBlockParameters {
   val param = ldaParams.head
   param.bindBackendParam(backendParams)
+  val issueBlockParam = intSchdParams.issueBlockParams.find(_.allExuParams.contains(param)).get
+  param.bindIssueBlockParam(issueBlockParam)
   val io = IO(new LoadUnitIO(param))
   val ldu = Module(new NewLoadUnit(param))
   io <> ldu.io
