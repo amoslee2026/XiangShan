@@ -41,7 +41,6 @@ import xiangshan.frontend.IfuToInstrUncacheIO
 import xiangshan.frontend.InstrUncacheToIfuIO
 import xiangshan.frontend.PreDecodeInfo
 import xiangshan.frontend.PrunedAddr
-import xiangshan.frontend.PrunedAddrInit
 import xiangshan.frontend.bpu.BranchAttribute
 import xiangshan.frontend.ibuffer.IBufPtr
 import xiangshan.frontend.icache.PmpCheckBundle
@@ -219,7 +218,7 @@ class Ifu(implicit p: Parameters) extends IfuModule
   private val s1_prevIBufEnqPtr     = RegInit(0.U.asTypeOf(new IBufPtr))
   private val s1_prevEndIsHalfRvi   = RegEnable(s0_prevEndIsHalfRvi, s0_fire)
   private val s1_prevEndHalfRviData = RegInit(0.U(16.W))
-  private val s1_prevEndHalfRviPc   = RegInit(0.U.asTypeOf(PrunedAddr(VAddrBits)))
+  private val s1_prevEndHalfRviPc   = RegInit(0.U.asTypeOf(PrunedAddr(GuardedVAddrBits)))
 
   private val s1_instrData    = RegEnable(s0_icacheData.data, s0_fire)
   private val s1_icacheMetaIn = RegEnable(s0_icacheMeta, s0_fire)
@@ -301,7 +300,7 @@ class Ifu(implicit p: Parameters) extends IfuModule
   // backendRedirect has the highest priority
   when(backendRedirect) {
     s1_prevEndHalfRviData := 0.U
-    s1_prevEndHalfRviPc   := 0.U.asTypeOf(PrunedAddr(VAddrBits))
+    s1_prevEndHalfRviPc   := 0.U.asTypeOf(PrunedAddr(GuardedVAddrBits))
   }.elsewhen(wbRedirect.valid) {
     s1_prevEndHalfRviData := wbRedirect.halfData
     s1_prevEndHalfRviPc   := wbRedirect.halfPc
@@ -410,12 +409,12 @@ class Ifu(implicit p: Parameters) extends IfuModule
   /* ** unache state handle ** */
   private val uncacheBusy = RegInit(false.B)
   // For uncache cross-page instr, the real PC is in the prev fetch block.
-  private val uncachePc = RegInit(0.U.asTypeOf(PrunedAddr(VAddrBits)))
+  private val uncachePc = RegInit(0.U.asTypeOf(PrunedAddr(GuardedVAddrBits)))
   // Uncache cross-page may hit seq fetch or mispred, check required.
   private val uncacheResendCheck = RegInit(false.B)
   when(s2_flush) {
     uncacheBusy := false.B
-    uncachePc   := 0.U.asTypeOf(PrunedAddr(VAddrBits))
+    uncachePc   := 0.U.asTypeOf(PrunedAddr(GuardedVAddrBits))
   }.elsewhen(uncacheUnit.io.req.fire) {
     uncacheBusy := true.B
     uncachePc   := Mux(s2_prevEndIsHalfRvi, s2_prevEndHalfPc, s2_alignedInstrPcVec(s2_alignShiftNum))
@@ -473,19 +472,23 @@ class Ifu(implicit p: Parameters) extends IfuModule
   dontTouch(s2_fixedInstrValid)
 
   /* ** frontend Trigger  ** */
-  frontendTrigger.io.pds             := s2_alignedPdInfoVec
-  frontendTrigger.io.pc              := s2_alignedInstrPcVec
+  frontendTrigger.io.pds := s2_alignedPdInfoVec
+  frontendTrigger.io.pc := VecInit(
+    s2_alignedInstrPcVec.map(_.truncate(VAddrBits))
+  )
   frontendTrigger.io.data            := 0.U.asTypeOf(Vec(IBufferEnqueueWidth + 1, UInt(16.W)))
   frontendTrigger.io.frontendTrigger := io.frontendTrigger
   private val s2_alignTriggered = frontendTrigger.io.triggered
 
   /* ** send to IBuffer ** */
-  io.toIBuffer.valid               := s2_toIBufferValid
-  io.toIBuffer.bits.instrs         := s2_expandedInstrDataVec
-  io.toIBuffer.bits.valid          := s2_alignedInstrValid
-  io.toIBuffer.bits.enqEnable      := s2_fixedInstrValid
-  io.toIBuffer.bits.isRvc          := s2_expandedInstrVec.map(_.isRvc)
-  io.toIBuffer.bits.pc             := s2_alignedInstrPcVec // for debug
+  io.toIBuffer.valid          := s2_toIBufferValid
+  io.toIBuffer.bits.instrs    := s2_expandedInstrDataVec
+  io.toIBuffer.bits.valid     := s2_alignedInstrValid
+  io.toIBuffer.bits.enqEnable := s2_fixedInstrValid
+  io.toIBuffer.bits.isRvc     := s2_expandedInstrVec.map(_.isRvc)
+  io.toIBuffer.bits.pc := VecInit(
+    s2_alignedInstrPcVec.map(_.truncate(VAddrBits))
+  ) // for debug
   io.toIBuffer.bits.prevIBufEnqPtr := s2_prevIBufEnqPtr
   io.toIBuffer.bits.ftqPtr.zipWithIndex.foreach { case (ftqPtr, i) =>
     ftqPtr := Mux(s2_blockSel(i), s2_fetchBlock(1).ftqIdx, s2_fetchBlock(0).ftqIdx)
@@ -584,7 +587,7 @@ class Ifu(implicit p: Parameters) extends IfuModule
     s2_valid && io.toIBuffer.ready && s2_reqIsUncache && !backendRedirect && (s2_uncacheCanGo || uncacheNeedResend)
   uncacheFlushWb.bits.canTrain  := false.B
   uncacheFlushWb.bits.ftqIdx    := s2_fetchBlock(0).ftqIdx
-  uncacheFlushWb.bits.pc        := s2_fetchBlock(0).startVAddr.toUInt
+  uncacheFlushWb.bits.pc        := s2_fetchBlock(0).startVAddr.toUInt(VAddrBits - 1, 0)
   uncacheFlushWb.bits.taken     := false.B
   uncacheFlushWb.bits.ftqOffset := uncacheMisEndOffset.bits
   uncacheFlushWb.bits.isRVC     := uncacheIsRvc
@@ -602,7 +605,7 @@ class Ifu(implicit p: Parameters) extends IfuModule
       uncacheRvcExpander.io.out.bits
     )
 
-    io.toIBuffer.bits.pc(s2_alignShiftNum)                    := uncachePc
+    io.toIBuffer.bits.pc(s2_alignShiftNum)                    := uncachePc.truncate(VAddrBits)
     io.toIBuffer.bits.isRvc(s2_alignShiftNum)                 := uncacheIsRvc
     io.toIBuffer.bits.instrEndOffset(s2_alignShiftNum).offset := Mux(uncacheIsRvc || s2_prevEndIsHalfRvi, 0.U, 1.U)
 
@@ -660,7 +663,7 @@ class Ifu(implicit p: Parameters) extends IfuModule
   private val checkFlushWb = {
     val b         = Wire(Valid(new FrontendRedirect))
     val ftqIdx    = VecInit(wbAlignFetchBlock.map(_.ftqIdx))
-    val startAddr = VecInit(wbAlignFetchBlock.map(_.startVAddr.toUInt))
+    val startAddr = VecInit(wbAlignFetchBlock.map(_.startVAddr.toUInt(VAddrBits - 1, 0)))
     val attribute = checkerRedirect.bits.attribute
     val canTrain  = attribute.isDirect || attribute.isReturn
     b.valid          := wbValid && checkerRedirect.valid

@@ -35,7 +35,7 @@ class PredChecker(implicit p: Parameters) extends IfuModule {
       val instrVec:      Vec[Instruction]   = Vec(IBufferEnqueueWidth, new Instruction)
       val jumpOffsetVec: Vec[PrunedAddr]    = Vec(IBufferEnqueueWidth, PrunedAddr(VAddrBits))
       val pdInfoVec:     Vec[PreDecodeInfo] = Vec(IBufferEnqueueWidth, new PreDecodeInfo)
-      val instrPcVec:    Vec[PrunedAddr]    = Vec(IBufferEnqueueWidth, PrunedAddr(VAddrBits))
+      val instrPcVec:    Vec[PrunedAddr]    = Vec(IBufferEnqueueWidth, PrunedAddr(GuardedVAddrBits))
     }
 
     class PredCheckerResp(implicit p: Parameters) extends IfuBundle {
@@ -130,7 +130,7 @@ class PredChecker(implicit p: Parameters) extends IfuModule {
   ))
 
   private val jumpTargets = VecInit(pdInfoVec.zipWithIndex.map { case (pd, i) =>
-    (instrPcVec(i) + jumpOffsetVec(i)).asTypeOf(PrunedAddr(VAddrBits))
+    instrPcVec(i) + jumpOffsetVec(i).signExt(GuardedVAddrBits)
   })
 
   private val fixedIsJump =
@@ -175,7 +175,8 @@ class PredChecker(implicit p: Parameters) extends IfuModule {
   io.resp.stage2Out.checkerRedirect.bits.attribute    := Mux(invalidTakenNext, BranchAttribute.None, finalAttributeNext)
   io.resp.stage2Out.checkerRedirect.bits.selectBlock  := finalSelectBlockNext
   io.resp.stage2Out.checkerRedirect.bits.invalidTaken := invalidTakenNext
-  io.resp.stage2Out.checkerRedirect.bits.mispredPc    := finalPcNext
+  io.resp.stage2Out.checkerRedirect.bits.mispredPc :=
+    finalPcNext.truncate(VAddrBits)
   // FIXME: Not a reliable block-end marker; special cases may have only half a branch predicted.(invalidTaken)
   io.resp.stage2Out.checkerRedirect.bits.endOffset := endOffsetNext
 

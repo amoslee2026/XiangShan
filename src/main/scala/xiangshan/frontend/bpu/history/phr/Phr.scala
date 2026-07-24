@@ -21,7 +21,6 @@ import org.chipsalliance.cde.config.Parameters
 import utility.XSPerfAccumulate
 import utility.XSWarn
 import xiangshan.frontend.PrunedAddr
-import xiangshan.frontend.PrunedAddrInit
 import xiangshan.frontend.bpu.Train
 
 // PHR: Predicted History Register
@@ -104,15 +103,15 @@ class Phr(implicit p: Parameters) extends PhrModule with HasPhrParameters with H
 
   redirectData.valid   := io.train.redirect.valid
   redirectData.taken   := io.train.redirect.bits.taken
-  redirectData.cfiPc   := io.train.redirect.bits.cfiPc
-  redirectData.target  := io.train.redirect.bits.target
+  redirectData.cfiPc   := io.train.redirect.bits.cfiPc.truncate(VAddrBits)
+  redirectData.target  := io.train.redirect.bits.target.truncate(VAddrBits)
   redirectData.phrMeta := io.train.redirect.bits.meta.phr
 
   s3_override             := io.train.s3_override
   s3_overrideData.valid   := s3_override
   s3_overrideData.taken   := io.train.s3_prediction.taken
   s3_overrideData.cfiPc   := getCfiPcFromPosition(io.train.s3_startPc, io.train.s3_prediction.cfiPosition)
-  s3_overrideData.target  := io.train.s3_prediction.target
+  s3_overrideData.target  := io.train.s3_prediction.target.truncate(VAddrBits)
   s3_overrideData.phrMeta := io.train.s3_phrMeta
 
   s1AbtbUpdateData.zip(io.s1Train.abtbPrediction).foreach { case (data, pred) =>
@@ -122,7 +121,7 @@ class Phr(implicit p: Parameters) extends PhrModule with HasPhrParameters with H
     // If the branch is actually not taken, we simply leave Phr unchanged
     data.taken              := s1_valid && pred.valid
     data.cfiPc              := getCfiPcFromPosition(io.s1Train.startPc, pred.bits.cfiPosition)
-    data.target             := pred.bits.target
+    data.target             := pred.bits.target.truncate(VAddrBits)
     data.phrMeta.phrPtr     := s1_phrPtr
     data.phrMeta.phrLowBits := s1_phrValue(PathHashHighWidth - 1, 0)
   }
@@ -130,7 +129,7 @@ class Phr(implicit p: Parameters) extends PhrModule with HasPhrParameters with H
   s1UbtbUpdateData.valid  := s1_valid
   s1UbtbUpdateData.taken  := io.s1Train.ubtbPrediction.bits.taken
   s1UbtbUpdateData.cfiPc  := getCfiPcFromPosition(io.s1Train.startPc, io.s1Train.ubtbPrediction.bits.cfiPosition)
-  s1UbtbUpdateData.target := io.s1Train.ubtbPrediction.bits.target
+  s1UbtbUpdateData.target := io.s1Train.ubtbPrediction.bits.target.truncate(VAddrBits)
   s1UbtbUpdateData.phrMeta.phrPtr     := s1_phrPtr
   s1UbtbUpdateData.phrMeta.phrLowBits := s1_phrValue(PathHashHighWidth - 1, 0)
 

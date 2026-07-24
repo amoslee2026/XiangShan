@@ -94,8 +94,9 @@ class MicroBtb(implicit p: Parameters) extends BasePredictor with HasMicroBtbPar
   io.prediction.valid            := s1_hit
   io.prediction.bits.taken       := s1_hit
   io.prediction.bits.cfiPosition := s1_hitEntry.slot1.position
-  io.prediction.bits.target      := getFullTarget(s1_startPc, s1_hitEntry.slot1.target, s1_hitEntry.slot1.targetCarry)
-  io.prediction.bits.attribute   := s1_hitEntry.slot1.attribute
+  io.prediction.bits.target :=
+    getFullTarget(s1_startPc, s1_hitEntry.slot1.target, s1_hitEntry.slot1.targetCarry)
+  io.prediction.bits.attribute := s1_hitEntry.slot1.attribute
 
   // update replacer
   replacer.io.predTouch.valid := s1_hit && s1_fire
@@ -119,7 +120,7 @@ class MicroBtb(implicit p: Parameters) extends BasePredictor with HasMicroBtbPar
     t0_startPc     := io.fastTrain.get.bits.startPc
     t0_actualTaken := io.fastTrain.get.bits.finalPrediction.taken
     t0_position    := io.fastTrain.get.bits.finalPrediction.cfiPosition
-    t0_fullTarget  := io.fastTrain.get.bits.finalPrediction.target
+    t0_fullTarget  := io.fastTrain.get.bits.finalPrediction.target.truncate(VAddrBits)
     t0_attribute   := io.fastTrain.get.bits.finalPrediction.attribute
   } else {
     // FIXME: not sure if first mispredict is the best, maybe first taken?

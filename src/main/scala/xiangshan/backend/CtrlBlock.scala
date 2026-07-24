@@ -100,7 +100,9 @@ class CtrlBlockImp(
   val redirectGen = Module(new RedirectGenerator)
   val lsqEnqCtrl = Module(new LsqEnqCtrl)
   private def hasRen: Boolean = true
-  private val pcMem = Module(new SyncDataModuleTemplate(PrunedAddr(VAddrBits), FtqSize, numPcMemRead, 1, "BackendPC", hasRen = hasRen))
+  private val pcMem = Module(
+    new SyncDataModuleTemplate(PrunedAddr(GuardedVAddrBits), FtqSize, numPcMemRead, 1, "BackendPC", hasRen = hasRen)
+  )
   private val rob = wrapper.rob.module
   private val memCtrl = Module(new MemCtrl(params))
 
@@ -243,7 +245,7 @@ class CtrlBlockImp(
     val roffset = io.toDataPath.pcToDataPathIO.fromDataPathFtqOffset(i)
     pcMem.io.ren.get(pcMemIdx) := ren
     pcMem.io.raddr(pcMemIdx) := raddr
-    io.toDataPath.pcToDataPathIO.toDataPathPC(i) := pcMem.io.rdata(pcMemIdx).toUInt
+    io.toDataPath.pcToDataPathIO.toDataPathPC(i) := pcMem.io.rdata(pcMemIdx).truncate(VAddrBits).toUInt
   }
 
   for ((pcMemIdx, i) <- pcMemRdIndexes("bjuTarget").zipWithIndex) {
@@ -252,7 +254,7 @@ class CtrlBlockImp(
     val raddr = io.toDataPath.pcToDataPathIO.fromDataPathFtqPtr(i).value + 1.U
     pcMem.io.ren.get(pcMemIdx) := ren
     pcMem.io.raddr(pcMemIdx) := raddr
-    io.toDataPath.pcToDataPathIO.toDataPathTargetPC(i) := pcMem.io.rdata(pcMemIdx).toUInt
+    io.toDataPath.pcToDataPathIO.toDataPathTargetPC(i) := pcMem.io.rdata(pcMemIdx).truncate(VAddrBits).toUInt
   }
 
   val baseIdx = params.BrhCnt
@@ -263,14 +265,16 @@ class CtrlBlockImp(
     val roffset = io.toDataPath.pcToDataPathIO.fromDataPathFtqOffset(baseIdx+i)
     pcMem.io.ren.get(pcMemIdx) := ren
     pcMem.io.raddr(pcMemIdx) := raddr
-    io.toDataPath.pcToDataPathIO.toDataPathPC(baseIdx+i) := pcMem.io.rdata(pcMemIdx).toUInt
+    io.toDataPath.pcToDataPathIO.toDataPathPC(baseIdx+i) :=
+      pcMem.io.rdata(pcMemIdx).truncate(VAddrBits).toUInt
   }
 
   for ((pcMemIdx, i) <- pcMemRdIndexes("hybrid").zipWithIndex) {
     // load read pcMem (s0) -> get rdata (s1) -> reg next in Memblock (s2) -> reg next in Memblock (s3) -> consumed by pf (s3)
     pcMem.io.ren.get(pcMemIdx) := io.memHyPcRead(i).valid
     pcMem.io.raddr(pcMemIdx) := io.memHyPcRead(i).ptr.value
-    io.memHyPcRead(i).data := pcMem.io.rdata(pcMemIdx).toUInt + (RegEnable(io.memHyPcRead(i).offset, io.memHyPcRead(i).valid) << instOffsetBits)
+    io.memHyPcRead(i).data := pcMem.io.rdata(pcMemIdx).truncate(VAddrBits).toUInt +
+      (RegEnable(io.memHyPcRead(i).offset, io.memHyPcRead(i).valid) << instOffsetBits)
   }
 
   if (EnableStorePrefetchSMS) {
@@ -278,7 +282,8 @@ class CtrlBlockImp(
       pcMem.io.ren.get(pcMemIdx) := io.memStPcRead(i).valid
       pcMem.io.raddr(pcMemIdx) := io.memStPcRead(i).ptr.value
       // memStPcRead.data is not right bucasue memStPcRead don't have isRVC
-      io.memStPcRead(i).data := pcMem.io.rdata(pcMemIdx).toUInt + (RegEnable(io.memStPcRead(i).offset, io.memStPcRead(i).valid) << instOffsetBits)
+      io.memStPcRead(i).data := pcMem.io.rdata(pcMemIdx).truncate(VAddrBits).toUInt +
+        (RegEnable(io.memStPcRead(i).offset, io.memStPcRead(i).valid) << instOffsetBits)
     }
   } else {
     io.memStPcRead.foreach(_.data := 0.U)
@@ -297,7 +302,7 @@ class CtrlBlockImp(
     val traceValid = trace.toPcMem.blocks(i).valid
     pcMem.io.ren.get(pcMemIdx) := traceValid
     pcMem.io.raddr(pcMemIdx) := trace.toPcMem.blocks(i).bits.ftqIdx.get.value
-    tracePcStart(i) := pcMem.io.rdata(pcMemIdx).toUInt
+    tracePcStart(i) := pcMem.io.rdata(pcMemIdx).truncate(VAddrBits).toUInt
   }
 
   // Trap/Xret only occur in block(0).

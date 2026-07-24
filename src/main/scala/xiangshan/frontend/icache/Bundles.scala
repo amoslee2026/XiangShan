@@ -29,6 +29,7 @@ import xiangshan.frontend.ExceptionType
 import xiangshan.frontend.FetchRequestBundle
 import xiangshan.frontend.FtqFetchRequest
 import xiangshan.frontend.PrunedAddr
+import xiangshan.frontend.PrunedAddrInit
 import xiangshan.frontend.ftq.FtqPtr
 import xiangshan.frontend.ifu.IfuBundle
 
@@ -219,7 +220,7 @@ class ICacheMeta(implicit p: Parameters) extends ICacheBundle {
 
 class MainPipeToIfuReq(implicit p: Parameters) extends ICacheBundle {
   val valid:          Bool        = Bool()
-  val startVAddr:     PrunedAddr  = PrunedAddr(VAddrBits)
+  val startVAddr:     PrunedAddr  = PrunedAddr(GuardedVAddrBits)
   val ftqIdx:         FtqPtr      = new FtqPtr
   val takenCfiOffset: Valid[UInt] = Valid(UInt(CfiPositionWidth.W))
   val range:          UInt        = UInt(FetchBlockInstNum.W)
@@ -249,15 +250,15 @@ class MainPipeToWayLookupBundle(implicit p: Parameters) extends ICacheBundle {
 
 /* ***** PrefetchPipe ***** */
 class PrefetchReqBundle(implicit p: Parameters) extends ICacheBundle {
-  val startVAddr:       PrunedAddr    = PrunedAddr(VAddrBits)
-  val nextLineVAddr:    PrunedAddr    = PrunedAddr(VAddrBits)
+  val startVAddr:       PrunedAddr    = PrunedAddr(GuardedVAddrBits)
+  val nextLineVAddr:    PrunedAddr    = PrunedAddr(GuardedVAddrBits)
   val isCrossLine:      Bool          = Bool()
   val ftqIdx:           FtqPtr        = new FtqPtr
   val backendException: ExceptionType = new ExceptionType
   val isSoftPrefetch:   Bool          = Bool()
 
   def fromSoftPrefetch(req: SoftIfetchPrefetchBundle): PrefetchReqBundle = {
-    startVAddr       := req.vaddr
+    startVAddr       := PrunedAddrInit(req.vaddr).signExt(GuardedVAddrBits)
     nextLineVAddr    := DontCare
     isCrossLine      := false.B
     ftqIdx           := DontCare

@@ -338,8 +338,9 @@ class Ftq(implicit p: Parameters) extends FtqModule
   // TODO: only valid should be needed
   io.toIfu.redirect.bits := DontCare
 
-  io.toBpu.redirect.valid          := redirect.valid
-  io.toBpu.redirect.bits.cfiPc     := getCfiPcFromOffset(PrunedAddrInit(redirect.bits.pc), redirect.bits.ftqOffset)
+  io.toBpu.redirect.valid := redirect.valid
+  io.toBpu.redirect.bits.cfiPc :=
+    getCfiPcFromOffset(entryQueue(redirect.bits.ftqIdx.value).startPc, redirect.bits.ftqOffset)
   io.toBpu.redirect.bits.target    := redirect.bits.target
   io.toBpu.redirect.bits.taken     := redirect.bits.taken
   io.toBpu.redirect.bits.attribute := redirect.bits.attribute

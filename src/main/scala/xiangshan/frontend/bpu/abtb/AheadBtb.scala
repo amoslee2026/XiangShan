@@ -203,7 +203,8 @@ class AheadBtb(implicit p: Parameters) extends BasePredictor with Helpers {
     pred.bits.taken       := s2_ctrResult(i)
     pred.bits.cfiPosition := s2_entries(i).position
     pred.bits.attribute   := s2_entries(i).attribute
-    pred.bits.target      := getFullTarget(s2_startPc, s2_entries(i).targetLowerBits, s2_entries(i).targetCarry)
+    pred.bits.target :=
+      getFullTarget(s2_startPc, s2_entries(i).targetLowerBits, s2_entries(i).targetCarry)
   }
   // Advance the calculation of critical control signals.
   io.predCtrl.jumpValidVec      := s2_jumpValidVec
@@ -235,7 +236,7 @@ class AheadBtb(implicit p: Parameters) extends BasePredictor with Helpers {
   }
 
   // used for check abtb output
-  io.debug_startPc := s2_startPc
+  io.debug_startPc := s2_startPc.truncate(VAddrBits)
 
   replacers.zipWithIndex.foreach { case (r, i) =>
     r.io.readValid   := s2_valid && s2_hit && s2_bankMask(i)
