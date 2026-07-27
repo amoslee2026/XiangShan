@@ -361,7 +361,7 @@ class HgatpBundle extends CSRBundle {
   val PPN = RW(43, 0).withReset(0.U).withDescription("Root page-table physical page number for G-stage translation.")
 }
 
-class HEnvCfg extends EnvCfg {
+class HEnvCfg(implicit p: Parameters) extends EnvCfg {
   if (CSRConfig.EXT_SSTC) {
     this.STCE.setRW().withReset(1.U)
   }

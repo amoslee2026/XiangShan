@@ -10,7 +10,7 @@ import xiangshan.backend.fu.NewCSR.CSRConfig.{VaddrMaxWidth, XLEN}
 import xiangshan.backend.fu.NewCSR.CSRDefines.{HgatpMode, SatpMode}
 import xiangshan.backend.fu.NewCSR._
 import xiangshan.AddrTransType
-
+import xiangshan.HasXSParameter
 
 class TrapEntryVSEventOutput extends Bundle with EventUpdatePrivStateOutput with EventOutputBase  {
 
@@ -20,7 +20,7 @@ class TrapEntryVSEventOutput extends Bundle with EventUpdatePrivStateOutput with
   val vstval   = ValidIO((new OneFieldBundle).addInEvent(_.ALL))
 }
 
-class TrapEntryVSEventModule(implicit val p: Parameters) extends Module with CSREventBase {
+class TrapEntryVSEventModule(implicit val p: Parameters) extends Module with CSREventBase with HasXSParameter {
   val in = IO(new TrapEntryEventInput)
   val out = IO(new TrapEntryVSEventOutput)
 
@@ -90,6 +90,12 @@ class TrapEntryVSEventModule(implicit val p: Parameters) extends Module with CSR
     (isFetchExcp || isFetchBkpt) && fetchIsVirt ||
     (isMemExcp || isMemBkpt) && memIsVirt
   private val tvalFillInst     = isIllegalInst
+  // Zicfiss: internal Zicfiss/Zicfilp bits both report architectural software-check cause 18.
+  private val isZicfissSoftwareCheck = isException && zicfissException.U === highPrioTrapNO
+  private val isZicfilpSoftwareCheck = isException && zicfilpException.U === highPrioTrapNO
+  private val isSoftwareCheck = isZicfissSoftwareCheck || isZicfilpSoftwareCheck
+  private val softwareCheckTval = Mux(isZicfissSoftwareCheck, 3.U, 2.U)
+  private val trapExceptionCode = Mux(isZicfissSoftwareCheck, zicfilpException.U, highPrioTrapNO)
 
   private val tval = Mux1H(Seq(
     tvalFillPc       -> trapPC,

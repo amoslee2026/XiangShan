@@ -779,7 +779,7 @@ class Mtval2Bundle extends FieldInitBundle(Some("Guest physical address or addit
 
 class MhpmcounterBundle extends FieldInitBundle(Some("Hardware performance-monitoring counter value."))
 
-class MEnvCfg(implicit val p: Parameters) extends EnvCfg with HasXSParameter{
+class MEnvCfg(implicit p: Parameters) extends EnvCfg {
   if (CSRConfig.EXT_SSTC) {
     this.STCE.setRW().withReset(1.U)
   }
@@ -789,9 +789,6 @@ class MEnvCfg(implicit val p: Parameters) extends EnvCfg with HasXSParameter{
     // software write envcfg to open ssdbltrp if need
     // set 0 to pass ci
     this.DTE.setRW().withReset(0.U)
-  }
-  if (HasShadowStack) {
-    this.SSE.setRW().withReset(0.U)
   }
 }
 

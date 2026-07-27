@@ -755,13 +755,16 @@ package object xiangshan {
 
     // Zicfiss shadow stack load/store/amo.
     // Keep size in bit(1, 0), same as normal LSU ops.
-    def sspread   = "b110011".U
-    def sspush     = "b110111".U
-    def ssamoswap  = "b111011".U
-    def isShadowStackLoad(op: UInt): Bool = op === sspread
+    def ssamoswap_w = "b110010".U
+    def ssamoswap_d = "b110011".U
+    def sspush    = "b111011".U
+    def sspopchk  = "b111111".U
+    def isShadowStackLoad(op: UInt): Bool = op === sspopchk
     def isShadowStackStore(op: UInt): Bool = op === sspush
-    def isShadowStackAmo(op: UInt): Bool = op === ssamoswap
+    def isShadowStackAmo(op: UInt): Bool = op === ssamoswap_w || op === ssamoswap_d
 
+    def isZicfiss(fuOpType: UInt): Bool = fuOpType === ssamoswap_w || fuOpType === ssamoswap_d ||
+      fuOpType === sspush || fuOpType === sspopchk
     // store pipeline
     // normal store
     // bit encoding: | store 00 | size(2bit) |
@@ -1032,6 +1035,10 @@ package object xiangshan {
     def AMO_CAS_W        = "b110101".U // amocas_w
     def AMO_CAS_D        = "b110110".U // amocas_d
     def AMO_CAS_Q        = "b110111".U // amocas_q
+    // Zicfiss: split SSPUSH into shadow-stack memory and ssp update uops.
+    def ZICFISS_SSPUSH   = "b100110".U
+    // Zicfiss: split SSPOPCHK into shadow-stack check and ssp update uops.
+    def ZICFISS_SSPOPCHK = "b101000".U
     // dummy means that the instruction is a complex instruction but uop number is 1
     def dummy     = "b111111".U
 
@@ -1039,7 +1046,8 @@ package object xiangshan {
 
     def apply() = UInt(6.W)
     def needSplit(UopSplitType: UInt) = UopSplitType(4) || UopSplitType(5)
-
+    // Zicfiss: helper for shadow-stack split instructions.
+    def isZicfiss(UopSplitType: UInt): Bool = UopSplitType === ZICFISS_SSPUSH || UopSplitType === ZICFISS_SSPOPCHK
     def isAMOCAS(UopSplitType: UInt): Bool = UopSplitType === AMO_CAS_W || UopSplitType === AMO_CAS_D || UopSplitType === AMO_CAS_Q
   }
 
@@ -1062,6 +1070,8 @@ package object xiangshan {
     def storePageFault      = 15
     def doubleTrap          = 16
     def softwareCheck       = 18
+    def zicfissException    = 17 // software-check-exception of Zicfiss cause = 18, tval = 3
+    def zicfilpException    = 18 // software-check-exception of Zicfilp cause = 18, tval = 2
     def hardwareError       = 19
     def instrGuestPageFault = 20
     def loadGuestPageFault  = 21

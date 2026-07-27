@@ -94,7 +94,7 @@ case class XSCoreParameters
   // TODO: New frontend parameters system below. Replace the old parameters above during development.
   frontendParameters: FrontendParameters = FrontendParameters(),
   EnableLoadFastWakeUp: Boolean = true, // NOTE: not supported now, make it false
-  IntLogicRegs: Int = 32,
+  IntLogicRegsBase: Int = 32,
   FpLogicRegs: Int = 32 + 1 + 1, // 1: I2F, 1: stride
   VecLogicRegs: Int = 32 + 15, // 15: tmp
   V0LogicRegs: Int = 1, // V0
@@ -303,6 +303,8 @@ case class XSCoreParameters
   softPTWDelay: Int = 1,
   wfiResume: Boolean = true,
 ){
+  val IntLogicRegs: Int = IntLogicRegsBase + (if (HasShadowStack) 1 else 0)
+
   def ISABase = "rv64i"
   def ISAExtensions = Seq(
     // single letter extensions, in canonical order
@@ -371,15 +373,33 @@ case class XSCoreParameters
       IssueBlockParams(Seq(
         ExeUnitParams("ALU5", Seq(AluCfg, MulCfg), Seq(IntWB(port = 5, 0)), Seq(Seq(IntRD(10, 0)), Seq(IntRD(11, 1))), true, 2)
       ), numEntries = IssueQueueSize, numEnq = 2, numComp = IssueQueueCompEntrySize),
-      IssueBlockParams(Seq(
-        ExeUnitParams("LDU0", Seq(LduCfg), Seq(IntWB(6, 0), FpWB(4, 0)), Seq(Seq(IntRD(7, 0))), true, 2),
-      ), numEntries = 20, numEnq = 2, numComp = 12),
-      IssueBlockParams(Seq(
-        ExeUnitParams("LDU1", Seq(LduCfg), Seq(IntWB(7, 0), FpWB(5, 0)), Seq(Seq(IntRD(9, 0))), true, 2),
-      ), numEntries = 20, numEnq = 2, numComp = 12),
-      IssueBlockParams(Seq(
-        ExeUnitParams("LDU2", Seq(LduCfg), Seq(IntWB(8, 0), FpWB(6, 0)), Seq(Seq(IntRD(11, 0))), true, 2),
-      ), numEntries = 20, numEnq = 2, numComp = 12),
+      if (HasShadowStack)(
+        IssueBlockParams(Seq(
+          ExeUnitParams("LDU0", Seq(LduCfgWithShadowStack), Seq(IntWB(6, 0), FpWB(4, 0)), Seq(Seq(IntRD(7, 0)), Seq(IntRD(12, 0))), true, 2),
+          ), numEntries = 16, numEnq = 2, numComp = 12),
+      ) else (
+        IssueBlockParams(Seq(
+          ExeUnitParams("LDU0", Seq(LduCfg), Seq(IntWB(6, 0), FpWB(4, 0)), Seq(Seq(IntRD(7, 0))), true, 2),
+          ), numEntries = 20, numEnq = 2, numComp = 12)
+      ),
+      if (HasShadowStack)(
+        IssueBlockParams(Seq(
+          ExeUnitParams("LDU1", Seq(LduCfgWithShadowStack), Seq(IntWB(7, 0), FpWB(5, 0)), Seq(Seq(IntRD(9, 0)), Seq(IntRD(13, 0))), true, 2),
+        ), numEntries = 20, numEnq = 2, numComp = 12),
+      ) else (
+        IssueBlockParams(Seq(
+          ExeUnitParams("LDU1", Seq(LduCfg), Seq(IntWB(7, 0), FpWB(5, 0)), Seq(Seq(IntRD(9, 0))), true, 2),
+        ), numEntries = 20, numEnq = 2, numComp = 12)
+      ),
+      if (HasShadowStack)(
+        IssueBlockParams(Seq(
+          ExeUnitParams("LDU2", Seq(LduCfgWithShadowStack), Seq(IntWB(8, 0), FpWB(6, 0)), Seq(Seq(IntRD(11, 0)), Seq(IntRD(14, 0))), true, 2),
+          ), numEntries = 20, numEnq = 2, numComp = 12)
+      ) else (
+        IssueBlockParams(Seq(
+          ExeUnitParams("LDU2", Seq(LduCfg), Seq(IntWB(8, 0), FpWB(6, 0)), Seq(Seq(IntRD(11, 0))), true, 2),
+          ), numEntries = 20, numEnq = 2, numComp = 12)
+      ),
       IssueBlockParams(Seq(
         ExeUnitParams("STA0", Seq(StaCfg, MouCfg), Seq(FakeIntWB()), Seq(Seq(IntRD(6, 1)))),
       ), numEntries = 16, numEnq = 2, numComp = 12),

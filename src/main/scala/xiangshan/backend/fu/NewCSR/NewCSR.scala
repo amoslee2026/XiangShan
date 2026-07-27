@@ -327,6 +327,15 @@ class NewCSR(implicit val p: Parameters) extends Module
   val legalMNret = permitMod.io.out.hasLegalMNret
   val legalDret  = permitMod.io.out.hasLegalDret
 
+  // Zicfiss: whether enable shadow stack for current privilege mode.
+  // M-mode does not activate Zicfiss.
+  val enableZicfiss =
+    isModeHS && menvcfg.regOut.SSE.asBool ||
+    isModeHU && menvcfg.regOut.SSE.asBool && senvcfg.regOut.SSE.asBool ||
+    isModeVS && menvcfg.regOut.SSE.asBool && henvcfg.regOut.SSE.asBool ||
+    isModeVU && menvcfg.regOut.SSE.asBool && henvcfg.regOut.SSE.asBool && senvcfg.regOut.SSE.asBool
+  dontTouch(enableZicfiss)
+
   private val wenLegalReg = GatedValidRegNext(wenLegal)
 
   var csrRwMap: SeqMap[Int, (CSRAddrWriteBundle[_], UInt)] =
@@ -1577,6 +1586,10 @@ class NewCSR(implicit val p: Parameters) extends Module
   io.toDecode.illegalInst.wrs_nto    := !isModeM && mstatus.regOut.TW
   io.toDecode.virtualInst.wrs_nto    := privState.V && !mstatus.regOut.TW && hstatus.regOut.VTW
   io.toDecode.illegalInst.frm        := frmIsReserved
+  // Zicfiss
+  if(HasShadowStack) {
+    io.toDecode.enableZicfiss.get := enableZicfiss
+  }
   // Ref: The RISC-V Instruction Set Manual Volume I - 20.5. Control and Status Register State
   io.toDecode.illegalInst.cboZ       := !isModeM && !menvcfg.regOut.CBZE || isModeHU && !senvcfg.regOut.CBZE
   io.toDecode.virtualInst.cboZ       := menvcfg.regOut.CBZE && (

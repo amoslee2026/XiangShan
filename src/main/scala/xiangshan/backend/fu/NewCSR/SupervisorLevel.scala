@@ -3,6 +3,7 @@ package xiangshan.backend.fu.NewCSR
 import chisel3._
 import chisel3.util.BitPat.bitPatToUInt
 import chisel3.util.{BitPat, Cat, Fill, Mux1H, MuxCase, ValidIO}
+import org.chipsalliance.cde.config.Parameters
 import utility.{SignExt, ZeroExt}
 import xiangshan.backend.fu.NewCSR.CSRBundles._
 import xiangshan.backend.fu.NewCSR.CSRDefines._
@@ -267,7 +268,7 @@ class ScontextBundle extends CSRBundle {
   val ALL = RW(31, 0).withReset(0.U).withDescription("Supervisor trigger context value.")
 }
 
-class SEnvCfg extends EnvCfg
+class SEnvCfg(implicit p: Parameters) extends EnvCfg
 
 class SipToMip extends IpValidBundle {
   this.SSIP.bits.setRW()

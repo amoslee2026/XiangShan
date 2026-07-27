@@ -1020,7 +1020,10 @@ class RobImp(override val wrapper: Rob)(implicit p: Parameters, params: BackendP
   val enqRobIdxSeq = io.enq.req.map(req => req.bits.robIdx.value)
   val enqUopNumVec = VecInit(io.enq.req.map(req => req.bits.numUops))
   val enqWBNumVec = VecInit(io.enq.req.map(req => req.bits.numWB))
-  private val enqWriteStdVec = VecInit(io.enq.req.map(req => req.bits.stdwriteNeed))
+  private val enqWriteStdVec = VecInit(io.enq.req.map{req =>
+    val isZicfissSplitStoreHead = req.bits.commitType === CommitType.STORE &&
+      FuType.isCsr(req.bits.fuType) && req.bits.ldest >= 32.U
+    req.bits.stdwriteNeed || (if (HasShadowStack) isZicfissSplitStoreHead else false.B)})
 
   val fflags_wb = fflagsWBs
   val vxsat_wb = vxsatWBs

@@ -584,4 +584,6 @@ class CSRToDecode(implicit p: Parameters) extends XSBundle {
      */
     val cboI2F = Bool()
   }
+  //  Zicfiss
+  val enableZicfiss = Option.when(HasShadowStack)(Bool())
 }

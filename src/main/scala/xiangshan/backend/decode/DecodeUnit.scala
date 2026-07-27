@@ -515,7 +515,7 @@ object HypervisorDecode extends DecodeConstants {
 
 object MptFenceDecode extends DecodeConstants {
   override val decodeArray: Array[(BitPat, XSDecodeBase)] = Array(
-    MFENCE -> XSDecode(SrcType.reg, SrcType.reg, SrcType.X, FuType.fence, FenceOpType.mfence, SelImm.X, noSpec = T, blockBack = T, flushPipe = T),
+    MFENCE_PA -> XSDecode(SrcType.reg, SrcType.reg, SrcType.X, FuType.fence, FenceOpType.mfence, SelImm.X, noSpec = T, blockBack = T, flushPipe = T),
   )
 }
 object ZicondDecode extends DecodeConstants {
@@ -533,6 +533,16 @@ object ZimopDecode extends DecodeConstants {
     // temp use addi to decode MOP_R and MOP_RR
     MOP_R  -> XSDecode(SrcType.reg, SrcType.imm, SrcType.X, FuType.alu, ALUOpType.add, SelImm.IMM_I, xWen = T, canRobCompress = T),
     MOP_RR -> XSDecode(SrcType.reg, SrcType.reg, SrcType.X, FuType.alu, ALUOpType.add, SelImm.IMM_I, xWen = T, canRobCompress = T),
+  )
+}
+
+// Zicfiss: SSAMOSWAP.W/D use non-Zimop AMO encodings, so they can live in the static decode table.
+object ZicfissDecode extends DecodeConstants {
+  override val decodeArray: Array[(BitPat, XSDecodeBase)] = Array(
+    // Zicfiss: reuse the AMOSWAP MOU path; shadow-stack-specific checks are handled by later stages.
+    SSAMOSWAP_W -> XSDecode(SrcType.reg, SrcType.reg, SrcType.X, FuType.mou, LSUOpType.ssamoswap_w, SelImm.X, xWen = T, noSpec = T, blockBack = T),
+    // Zicfiss: reuse the AMOSWAP MOU path; shadow-stack-specific checks are handled by later stages.
+    SSAMOSWAP_D -> XSDecode(SrcType.reg, SrcType.reg, SrcType.X, FuType.mou, LSUOpType.ssamoswap_d, SelImm.X, xWen = T, noSpec = T, blockBack = T),
   )
 }
 
@@ -812,7 +822,8 @@ class DecodeUnit(implicit p: Parameters) extends XSModule with DecodeUnitConstan
     ZicondDecode.table ++
     ZimopDecode.table ++
     ZfaDecode.table ++
-    (if (HasMptCheck) MptFenceDecode.table else Array.empty[(BitPat, List[BitPat])])
+    (if (HasMptCheck) MptFenceDecode.table else Array.empty[(BitPat, List[BitPat])]) ++
+    (if (HasShadowStack) ZicfissDecode.table else Array.empty[(BitPat, List[BitPat])])
   require(decode_table.map(_._2.length == 14).reduce(_ && _), "Decode tables have different column size")
   // assertion for LUI: only LUI should be assigned `selImm === SelImm.IMM_U && fuType === FuType.alu`
   val luiMatch = (t: Seq[BitPat]) => t(3).value == FuType.alu.ohid && t.reverse.head.value == SelImm.IMM_U.litValue
@@ -831,10 +842,30 @@ class DecodeUnit(implicit p: Parameters) extends XSModule with DecodeUnitConstan
 
   val isZimop = (BitPat("b1?00??0111??_?????_100_?????_1110011") === ctrl_flow.instr) ||
                 (BitPat("b1?00??1?????_?????_100_?????_1110011") === ctrl_flow.instr)
-
+    // Zicfiss Instruction: SSPUSH SSPOPCHK SSRDP generate.
+  private val zicfissActive = io.fromCSR.enableZicfiss.getOrElse(false.B)
+  // Zicfiss: ssp CSR address used by SSRDP conversion.
+  private val zicfissSSPCSRAddr = 0x011.U(12.W)
+  // Zicfiss: SSPUSH/SSPOPCHK only use the conventional link registers.
+  private val isSSPOPCHKrs1Legal = inst.RS1 === 1.U || inst.RS1 === 5.U
+  private val isSSPUSHrs2Legal = inst.RS2 === 1.U || inst.RS2 === 5.U
+  // Zicfiss: use fully constrained instruction patterns before operand legality checks.
+  private val isZicfissSSPUSHPattern = SSPUSH === ctrl_flow.instr
+  private val isZicfissSSPOPCHKPattern = SSPOPCHK === ctrl_flow.instr
+  private val isZicfissSSRDPPattern = SSRDP === ctrl_flow.instr
+  private val isZicfissSSPUSH = isZicfissSSPUSHPattern && isSSPUSHrs2Legal
+  private val isZicfissSSPOPCHK = isZicfissSSPOPCHKPattern && isSSPOPCHKrs1Legal
+  private val isZicfissSSRDP = isZicfissSSRDPPattern && inst.RD =/= 0.U
+  // illegal SSPOPCHK, SSRDP, SSPUSH will fall back to Zimop
+  private val isZicfissMOP = isZicfissSSPUSH || isZicfissSSPOPCHK || isZicfissSSRDP
+  private val isZicfissMOPActive = zicfissActive && isZicfissMOP
+  private val isZicfissSSAMOSWAP = (SSAMOSWAP_W === ctrl_flow.instr) || (SSAMOSWAP_D === ctrl_flow.instr)
   val isMove = BitPat("b000000000000_?????_000_?????_0010011") === ctrl_flow.instr
   // temp decode zimop as move
-  decodedInst.isMove := (isMove || isZimop) && ctrl_flow.instr(RD_MSB, RD_LSB) =/= 0.U && !io.csrCtrl.singlestep
+  // Zicfiss: active shadow-stack MOP encodings must not be eliminated as Zimop moves.
+  // illegal SSPOPCHK, SSRDP, SSPUSH will fall back to Zimop
+  decodedInst.isMove := (isMove || (isZimop && (if (HasShadowStack) !isZicfissMOPActive else true.B))) &&
+    ctrl_flow.instr(RD_MSB, RD_LSB) =/= 0.U && !io.csrCtrl.singlestep
 
   // fmadd - b1000011
   // fmsub - b1000111
@@ -903,8 +934,9 @@ class DecodeUnit(implicit p: Parameters) extends XSModule with DecodeUnitConstan
     (io.fromCSR.illegalInst.cboCF || !HasCMO.B) && (isCboClean || isCboFlush) ||
     (io.fromCSR.illegalInst.cboI  || !HasCMO.B) && isCboInval ||
     isAes64ks1iIllegal ||
-    isAmocasQIllegal
-
+    isAmocasQIllegal ||
+    (if(HasShadowStack) (isZicfissSSAMOSWAP && !zicfissActive) else false.B)
+    // Zicfiss: if Zicfiss not active, SSAMOSWAP_W/D is illegal
   private val exceptionVI =
     io.fromCSR.virtualInst.sfenceVMA  && FuType.FuTypeOrR(decodedInst.fuType, FuType.fence) && decodedInst.fuOpType === FenceOpType.sfence ||
     io.fromCSR.virtualInst.sfencePart && FuType.FuTypeOrR(decodedInst.fuType, FuType.fence) && decodedInst.fuOpType === FenceOpType.nofence ||
@@ -1153,7 +1185,65 @@ class DecodeUnit(implicit p: Parameters) extends XSModule with DecodeUnitConstan
   // for fli.s|fli.d instruction
   val isFLI = inst.FUNCT7 === BitPat("b11110??") && inst.RS2 === 1.U && inst.RM === 0.U && inst.OPCODE5Bit === OPCODE5Bit.OP_FP
 
-  when (isCsrrVl) {
+// Zicfiss: active MOP encodings override the default Zimop decode.
+  when ((if(HasShadowStack) zicfissActive && isZicfissSSPUSH else false.B)) {
+    decodedInst.srcType(0) := SrcType.no
+    decodedInst.srcType(1) := SrcType.reg
+    decodedInst.srcType(2) := SrcType.no
+    decodedInst.srcType(3) := SrcType.no
+    decodedInst.srcType(4) := SrcType.no
+    decodedInst.lsrc(1) := inst.RS2
+    decodedInst.ldest := 0.U
+    decodedInst.fuType := FuType.stu.U
+    decodedInst.fuOpType := LSUOpType.sspush
+    // Zicfiss: mark SSPUSH for complex uop split.
+    decodedInst.uopSplitType := UopSplitType.ZICFISS_SSPUSH
+    decodedInst.rfWen := false.B
+    decodedInst.fpWen := false.B
+    decodedInst.vecWen := false.B
+    decodedInst.v0Wen := false.B
+    decodedInst.vlWen := false.B
+    decodedInst.waitForward := true.B
+    decodedInst.blockBackward := true.B
+    decodedInst.canRobCompress := false.B
+    decodedInst.commitType := Cat(true.B, true.B)
+  }.elsewhen (zicfissActive && isZicfissSSPOPCHK) {
+    decodedInst.srcType(0) := SrcType.reg
+    decodedInst.srcType(1) := SrcType.no
+    decodedInst.srcType(2) := SrcType.no
+    decodedInst.srcType(3) := SrcType.no
+    decodedInst.srcType(4) := SrcType.no
+    decodedInst.lsrc(0) := inst.RS1
+    decodedInst.ldest := 0.U
+    decodedInst.fuType := FuType.ldu.U
+    decodedInst.fuOpType := LSUOpType.sspopchk
+    // Zicfiss: mark SSPOPCHK for complex uop split.
+    decodedInst.uopSplitType := UopSplitType.ZICFISS_SSPOPCHK
+    decodedInst.rfWen := false.B
+    decodedInst.fpWen := false.B
+    decodedInst.vecWen := false.B
+    decodedInst.v0Wen := false.B
+    decodedInst.vlWen := false.B
+    decodedInst.waitForward := true.B
+    decodedInst.blockBackward := true.B
+    decodedInst.canRobCompress := false.B
+    decodedInst.commitType := Cat(true.B, false.B)
+  }.elsewhen (zicfissActive && isZicfissSSRDP) {
+    decodedInst.srcType(0) := SrcType.reg
+    decodedInst.srcType(1) := SrcType.imm
+    decodedInst.srcType(2) := SrcType.no
+    decodedInst.srcType(3) := SrcType.no
+    decodedInst.srcType(4) := SrcType.no
+    decodedInst.lsrc(0) := 0.U
+    decodedInst.ldest := inst.RD
+    decodedInst.fuType := FuType.csr.U
+    decodedInst.fuOpType := CSROpType.set
+    decodedInst.selImm := SelImm.IMM_Z
+    decodedInst.rfWen := true.B
+    decodedInst.waitForward := true.B
+    decodedInst.blockBackward := true.B
+    decodedInst.canRobCompress := false.B
+  }.elsewhen (isCsrrVl) {
     // convert to vsetvl instruction
     decodedInst.srcType(0) := SrcType.no
     decodedInst.srcType(1) := SrcType.no

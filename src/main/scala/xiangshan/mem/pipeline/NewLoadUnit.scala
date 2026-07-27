@@ -172,6 +172,7 @@ class LoadUnitS0(param: ExeUnitParams)(
   prefetch.hasROBEntry := false.B
   prefetch.missDbUpdated := false.B
   prefetch.occupySource := VecInit(sources.map(_.valid)).asUInt // for perf
+  prefetch.sspCheckValue.foreach(_ := 0.U)
   prefetchHiConf.valid := io.prefetchReq.valid && prefetchIsHiConf
   prefetchHiConf.bits := prefetch
   prefetchHiConf.bits.entrance := LoadEntrance.prefetchHiConf.U
@@ -188,6 +189,7 @@ class LoadUnitS0(param: ExeUnitParams)(
   vectorIssue.bits.DontCareUnalign() // assign later in sink
   vectorIssue.bits.DontCareReplayFromLRQFields()
   vectorIssue.bits.occupySource := VecInit(sources.map(_.valid)).asUInt // for perf
+  vectorIssue.bits.sspCheckValue.foreach(_ := 0.U)
 
   // 6. loads issued from IQ
   val ldin = io.ldin.bits
@@ -224,6 +226,7 @@ class LoadUnitS0(param: ExeUnitParams)(
   scalarIssue.bits.hasROBEntry := true.B
   scalarIssue.bits.missDbUpdated := false.B
   scalarIssue.bits.occupySource := VecInit(sources.map(_.valid)).asUInt // for perf
+  scalarIssue.bits.sspCheckValue.foreach(_ := ldin.src(1))
 
   // 7. low-confidence prefetch
   prefetchLoConf.valid := io.prefetchReq.valid
@@ -586,6 +589,8 @@ class LoadUnitS1(param: ExeUnitParams)(
   val fuOpType = uop.fuOpType
   val vaddr = in.vaddr
   val mask = in.mask
+  val isShadowStackLoad = if (HasShadowStack) LSUOpType.isShadowStackLoad(fuOpType) else false.B
+  val shadowStackMisaligned = isShadowStackLoad && !in.align.get
 
   val isSwInstrPrefetch = accessType.isSwPrefetch() && accessType.isInstrPrefetch()
 
@@ -626,9 +631,30 @@ class LoadUnitS1(param: ExeUnitParams)(
   val gpaddr = tlbResp.bits.gpaddr(0)
   val fullva = tlbResp.bits.fullva
 
-  val pf = tlbHit && tlbResp.bits.excp.head.pf.ld
-  val af = tlbHit && tlbResp.bits.excp.head.af.ld
-  val gpf = tlbHit && tlbResp.bits.excp.head.gpf.ld
+  val pf = if(HasShadowStack) (
+    tlbHit && Mux(
+    isShadowStackLoad,
+    tlbResp.bits.excp.head.pf.st,
+    tlbResp.bits.excp.head.pf.ld
+  ) && !shadowStackMisaligned) else (
+    tlbResp.bits.excp.head.pf.ld
+  )
+  val af = if(HasShadowStack) (
+    (tlbHit && Mux(
+    isShadowStackLoad,
+    tlbResp.bits.excp.head.af.st,
+    tlbResp.bits.excp.head.af.ld
+  )) || shadowStackMisaligned) else (
+    tlbResp.bits.excp.head.af.ld
+  )
+  val gpf = if(HasShadowStack) (
+    tlbHit && Mux(
+    isShadowStackLoad,
+    tlbResp.bits.excp.head.gpf.st,
+    tlbResp.bits.excp.head.gpf.ld
+  ) && !shadowStackMisaligned ) else (
+    tlbResp.bits.excp.head.gpf.ld
+  )
   val tlbException = pf || af || gpf
 
   val killDCache = kill || tlbMiss || tlbException
@@ -665,7 +691,7 @@ class LoadUnitS1(param: ExeUnitParams)(
   /**
     * Unalign tail inject to s0
     */
-  val unalignTailInjectValid = pipeIn.valid && in.unalignHead.get
+  val unalignTailInjectValid = pipeIn.valid && in.unalignHead.get && !isShadowStackLoad
   val unalignTail = Wire(io.unalignTail.bits.cloneType)
   connectSamePort(unalignTail, in)
   unalignTail.entrance := LoadEntrance.unalignTail.U
@@ -712,9 +738,14 @@ class LoadUnitS1(param: ExeUnitParams)(
   connectSamePort(stageInfo, in)
   stageInfo.uop.trigger := triggerAction
   stageInfo.uop.exceptionVec(breakPoint) := bp
-  stageInfo.uop.exceptionVec(loadPageFault) := pf
-  stageInfo.uop.exceptionVec(loadAccessFault) := af
-  stageInfo.uop.exceptionVec(loadGuestPageFault) := gpf
+  stageInfo.uop.exceptionVec(loadPageFault) := (if(HasShadowStack) pf && !isShadowStackLoad else pf)
+  stageInfo.uop.exceptionVec(loadAccessFault) := (if(HasShadowStack) af && !isShadowStackLoad else af)
+  stageInfo.uop.exceptionVec(loadGuestPageFault) := (if(HasShadowStack) gpf && !isShadowStackLoad else gpf)
+  if (HasShadowStack) {
+    stageInfo.uop.exceptionVec(storePageFault) := pf && isShadowStackLoad
+    stageInfo.uop.exceptionVec(storeAccessFault) := af && isShadowStackLoad
+    stageInfo.uop.exceptionVec(storeGuestPageFault) := gpf && isShadowStackLoad
+  }
   stageInfo.uop.perfDebugInfo.tlbRespTime := Mux(
     pipeIn.valid && paddrEffective,
     GTimer(),
