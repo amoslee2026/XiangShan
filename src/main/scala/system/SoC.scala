@@ -138,7 +138,8 @@ case class SoCParameters
   // when UsePrivateClint is false, mtip is from soc.
   UsePrivateClint: Boolean = false,
   WFIClockGate: Boolean = false,
-  EnablePowerDown: Boolean = false
+  EnablePowerDown: Boolean = false,
+  CHIAsyncFromDSU: Boolean = false // CHI Async bridge is from DSU
 ){
   require(
     !IMSICParams.HasTEEIMSIC || (IMSICParams.HasTEEIMSIC && IMSICBusType == device.IMSICBusType.AXI),
@@ -213,6 +214,7 @@ trait HasSoCParameter {
 
   val WFIClockGate = soc.WFIClockGate
   val EnablePowerDown = soc.EnablePowerDown
+  val CHIAsyncFromDSU = soc.CHIAsyncFromDSU
 
   def HasMEMencryption = cvm.HasMEMencryption
   require((cvm.HasMEMencryption && (cvm.KeyIDBits > 0)) || (!cvm.HasMEMencryption),
