@@ -293,6 +293,10 @@ class LoadQueueReplay(implicit p: Parameters) extends XSModule
   val cause = RegInit(VecInit(List.fill(LoadQueueReplaySize)(0.U(LoadReplayCauses.allCauses.W))))
   val blocking = RegInit(VecInit(List.fill(LoadQueueReplaySize)(false.B)))
   val strict = RegInit(VecInit(List.fill(LoadQueueReplaySize)(false.B)))
+  // Saturating residence timer for each LRQ entry. It covers the whole lifetime from the
+  // first allocation to normal release; re-replay and cause updates do not restart it.
+  private val replayResidenceWidth = 16
+  val replayResidenceCycles = RegInit(VecInit(List.fill(LoadQueueReplaySize)(0.U(replayResidenceWidth.W))))
 
   // freeliset: store valid entries index.
   // +---+---+--------------+-----+-----+
@@ -1002,6 +1006,60 @@ class LoadQueueReplay(implicit p: Parameters) extends XSModule
     val schedIndex = enq.bits.schedIndex
     enq.fire && !cancelEnq(w) && enq.bits.isLoadReplay && !needReplay(w) && allocated(schedIndex)
   })
+  // Entry-level release mask. Besides aggregating releases across load pipelines, it keeps
+  // the release cycle out of both the residence timer and the ROB-head waiting-cycle count.
+  val normalReleaseOH = VecInit((0 until LoadQueueReplaySize).map { entryIdx =>
+    VecInit(io.enq.zip(normalRelease).map { case (enq, release) =>
+      release && enq.bits.schedIndex === entryIdx.U
+    }).asUInt.orR
+  })
+  val newAllocate = VecInit(newEnqueue.zip(io.enq).map { case (newEnq, enq) =>
+    newEnq && enq.fire
+  })
+  val newAllocateOH = VecInit((0 until LoadQueueReplaySize).map { entryIdx =>
+    VecInit(newAllocate.zip(enqIndexOH).map { case (allocate, indexOH) =>
+      allocate && indexOH(entryIdx)
+    }).asUInt.orR
+  })
+
+  val replayResidenceMax = ((1 << replayResidenceWidth) - 1).U(replayResidenceWidth.W)
+  // Reset only for a newly allocated entry. Redirect/cancel stops the timer without creating
+  // a latency sample, while a live entry saturates at replayResidenceMax instead of wrapping.
+  replayResidenceCycles.zipWithIndex.foreach { case (timer, entryIdx) =>
+    when (newAllocateOH(entryIdx)) {
+      timer := 0.U
+    }.elsewhen (allocated(entryIdx) && !normalReleaseOH(entryIdx) && !needCancel(entryIdx)) {
+      when (timer =/= replayResidenceMax) {
+        timer := timer + 1.U
+      }
+    }
+  }
+
+  val releaseTimers = VecInit(io.enq.map(enq => replayResidenceCycles(enq.bits.schedIndex)))
+  // The timer contains completed cycles before the current cycle, so add the normal-release
+  // cycle to obtain T_release - T_enq. Saturated entries remain clamped at the maximum value.
+  val releaseLatencies = VecInit(releaseTimers.map { timer =>
+    Mux(timer === replayResidenceMax, replayResidenceMax, timer + 1.U)
+  })
+  // Attribute each normal release to the entry's final one-hot cause. The per-cause reductions
+  // preserve multiple releases in the same cycle by summing across all load pipelines.
+  val releaseCauseEvents = (0 until LoadReplayCauses.allCauses).map { causeIdx =>
+    VecInit(io.enq.zipWithIndex.map { case (enq, w) =>
+      normalRelease(w) && cause(enq.bits.schedIndex)(causeIdx)
+    })
+  }
+  val releaseCauseCounts = releaseCauseEvents.map(PopCount(_))
+  val releaseCauseLatencies = releaseCauseEvents.map { events =>
+    events.zip(releaseLatencies).map { case (event, latency) =>
+      Mux(event, latency, 0.U(replayResidenceWidth.W))
+    }.reduce(_ +& _)
+  }
+  val releaseCauseSaturatedCounts = releaseCauseEvents.map { events =>
+    PopCount(events.zip(releaseTimers).map { case (event, timer) =>
+      event && timer === replayResidenceMax
+    })
+  }
+
   val scalarRobHeadRelease = VecInit(io.enq.zipWithIndex.map { case (enq, w) =>
     val schedIndex = enq.bits.schedIndex
     normalRelease(w) && !vecReplay(schedIndex).isvec && uop(schedIndex).robIdx === io.robHeadPtr
@@ -1013,6 +1071,20 @@ class LoadQueueReplay(implicit p: Parameters) extends XSModule
     })
   }
   val robHeadReleaseCauseCounts = robHeadReleaseCauseEvents.map(PopCount(_))
+  // Count unreleased scalar ROB-head occupancy using the current cause. Cancel and normal-release
+  // cycles are excluded. The OR reduction limits each cause to at most one increment per cycle.
+  val scalarUnreleasedRobHeadEntries = VecInit((0 until LoadQueueReplaySize).map { entryIdx =>
+    allocated(entryIdx) &&
+      !vecReplay(entryIdx).isvec &&
+      uop(entryIdx).robIdx === io.robHeadPtr &&
+      !needCancel(entryIdx) &&
+      !normalReleaseOH(entryIdx)
+  })
+  val scalarUnreleasedRobHeadByCause = (0 until LoadReplayCauses.allCauses).map { causeIdx =>
+    VecInit((0 until LoadQueueReplaySize).map { entryIdx =>
+      scalarUnreleasedRobHeadEntries(entryIdx) && cause(entryIdx)(causeIdx)
+    }).asUInt.orR
+  }
 
   io.enq.zipWithIndex.foreach { case (enq, w) =>
     val schedIndex = enq.bits.schedIndex
@@ -1027,9 +1099,23 @@ class LoadQueueReplay(implicit p: Parameters) extends XSModule
   }
   assert(robHeadReleaseCauseCounts.reduce(_ +& _) === PopCount(scalarRobHeadRelease),
     "replay cause increments must equal scalar ROB-head releases")
+  XSError(releaseCauseCounts.reduce(_ +& _) =/= PopCount(normalRelease),
+    "release cause increments must equal normal replay releases\n")
+  XSError(PopCount(normalReleaseOH) =/= PopCount(normalRelease),
+    "normal release entry mask must preserve the release count\n")
+  XSError(releaseCauseSaturatedCounts.reduce(_ +& _) > PopCount(normalRelease),
+    "saturated release increments must not exceed normal replay releases\n")
 
   LoadReplayCauses.perfCauseNames.zip(robHeadReleaseCauseCounts).foreach { case (causeName, count) =>
     XSPerfAccumulate(s"replay_${causeName}_scalar_release_rob_head", count)
+  }
+  // Offline average residence latency is release_latency_cycles / release_count. Saturation is
+  // reported separately so clamped samples can be identified when interpreting that average.
+  LoadReplayCauses.perfCauseNames.zipWithIndex.foreach { case (causeName, causeIdx) =>
+    XSPerfAccumulate(s"replay_${causeName}_release_latency_cycles", releaseCauseLatencies(causeIdx))
+    XSPerfAccumulate(s"replay_${causeName}_release_count", releaseCauseCounts(causeIdx))
+    XSPerfAccumulate(s"replay_${causeName}_release_latency_overflow", releaseCauseSaturatedCounts(causeIdx))
+    XSPerfAccumulate(s"replay_${causeName}_scalar_unreleased_rob_head_cycles", scalarUnreleasedRobHeadByCause(causeIdx))
   }
 
   val enqNumber               = PopCount(io.enq.map(enq => enq.fire && !enq.bits.isLoadReplay))
