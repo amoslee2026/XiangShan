@@ -982,6 +982,27 @@ class LoadUnitS2(param: ExeUnitParams)(
 
   val forwardInvalid = io.sqForwardResp.valid && io.sqForwardResp.bits.forwardInvalid
 
+  val requestedMask = in.mask
+  val sqForwardMask = Mux(
+    io.sqForwardResp.valid,
+    io.sqForwardResp.bits.forwardMask.asUInt,
+    0.U((VLEN / 8).W)
+  )
+  val sbufferForwardMask = Mux(
+    io.sbufferForwardResp.valid,
+    io.sbufferForwardResp.bits.forwardMask.asUInt,
+    0.U((VLEN / 8).W)
+  )
+  val sqSbufferMatchInvalid = io.sqForwardResp.valid && io.sqForwardResp.bits.matchInvalid ||
+    io.sbufferForwardResp.valid && io.sbufferForwardResp.bits.matchInvalid
+  val sqSbufferForwardValid = !sqDataInvalid && !forwardInvalid && !sqSbufferMatchInvalid
+  val sqRequestedForwardedMask = requestedMask & sqForwardMask
+  val sbufferRequestedForwardedMask = requestedMask & sbufferForwardMask
+  val sqSbufferForwardedMask = sqRequestedForwardedMask | sbufferRequestedForwardedMask
+  val sqForwarded = sqRequestedForwardedMask.orR
+  val sqSbufferForwarded = sqSbufferForwardValid && sqForwarded
+  val sqSbufferFullForwarded = sqSbufferForwarded && sqSbufferForwardedMask === requestedMask
+
   // MSHR / TileLink-D channel
   val mshrForwardDenied = io.mshrForwardResp.valid && io.mshrForwardResp.bits.denied
   val tldForwardDenied = io.tldForwardResp.valid && io.tldForwardResp.bits.denied
@@ -1184,6 +1205,8 @@ class LoadUnitS2(param: ExeUnitParams)(
   stageInfo.matchInvalid.get := matchInvalid && troubleMaker
   stageInfo.shouldWakeup.get := shouldWakeup
   stageInfo.shouldWriteback.get := shouldWriteback
+  stageInfo.sqSbufferForwarded.get := sqSbufferForwarded
+  stageInfo.sqSbufferFullForwarded.get := sqSbufferFullForwarded
 
   when (pipeIn.fire) { pipeOutBits := stageInfo }
 
@@ -1275,7 +1298,8 @@ class LoadUnitS2(param: ExeUnitParams)(
 class LoadUnitS3(param: ExeUnitParams)(
   implicit p: Parameters,
   override implicit val s: LoadStage = LoadS3()
-) extends LoadUnitStage(param) {
+) extends LoadUnitStage(param)
+  with HasPerfEvents {
   val io = IO(new Bundle() {
     val redirect = Flipped(ValidIO(new Redirect))
     val kill = Input(Bool())
@@ -1755,6 +1779,29 @@ class LoadUnitS3(param: ExeUnitParams)(
   /**
     * Perf counters
     */
+  val demandLoad = isScalar || isVector
+  val transactionReplay = shouldReplay || s4HeadValid && s4HeadShouldReplay
+  val loadFromSqSbufferBase = pipeIn.fire && !kill && demandLoad &&
+    !transactionReplay && !exception && !rarViolation && !matchInvalid && in.sqSbufferForwarded.get
+  val loadFromSqSbufferFullData = loadFromSqSbufferBase && in.sqSbufferFullForwarded.get
+  val loadFromSqSbufferPartialData = loadFromSqSbufferBase && !in.sqSbufferFullForwarded.get
+  val loadFromSqSbufferSuccess = loadFromSqSbufferPartialData || loadFromSqSbufferFullData
+  val loadSuccessfulWriteback = (io.ldout.toRob.fire || io.vecldout.fire) && !kill && demandLoad &&
+    !transactionReplay && !exception && !rollbackValid
+
+  XSPerfAccumulate("load_from_sq_sbuffer_success", loadFromSqSbufferSuccess)
+  XSPerfAccumulate("load_from_sq_sbuffer_partial_data", loadFromSqSbufferPartialData)
+  XSPerfAccumulate("load_from_sq_sbuffer_full_data", loadFromSqSbufferFullData)
+  XSPerfAccumulate("load_successful_writeback", loadSuccessfulWriteback)
+
+  val perfEvents = Seq(
+    ("load_from_sq_sbuffer_success", loadFromSqSbufferSuccess),
+    ("load_from_sq_sbuffer_partial_data", loadFromSqSbufferPartialData),
+    ("load_from_sq_sbuffer_full_data", loadFromSqSbufferFullData),
+    ("load_successful_writeback", loadSuccessfulWriteback)
+  )
+  generatePerfEvent()
+
   XSPerfAccumulate("rollback_total", rollbackValid)
   XSPerfAccumulate("rollback_rar_violation", rollbackValid && rarViolation)
   XSPerfAccumulate("rollback_match_invalid", rollbackValid && matchInvalid)

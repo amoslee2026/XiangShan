@@ -1777,13 +1777,32 @@ class MemBlockInlinedImp(outer: MemBlockInlined) extends LazyModuleImp(outer)
   pfevent.io.distribute_csr := csrCtrl.distribute_csr
   val csrevents = pfevent.io.hpmevent.slice(16,24)
 
-  val perfFromUnits = (newLoadUnits ++ Seq(sbuffer, lsq, dcache)).flatMap(_.getPerfEvents)
+  val loadPipelinePerfNames = Seq(
+    "load_from_sq_sbuffer_success",
+    "load_from_sq_sbuffer_partial_data",
+    "load_from_sq_sbuffer_full_data",
+    "load_successful_writeback"
+  )
+  val perfFromLoadUnits = newLoadUnits.map(_.getPerfEvents)
+  val perfFromLoadPipelines = loadPipelinePerfNames.map { name =>
+    val perUnit = perfFromLoadUnits.map(_.find(_._1 == name).get._2)
+    (name, perUnit.reduce(_ + _))
+  }
+  perfFromLoadPipelines.foreach { case (name, inc) => XSPerfAccumulate(name, inc) }
+
+  val perfFromLoadUnitsWithIndex = perfFromLoadUnits.zipWithIndex.flatMap { case (events, i) =>
+    events.map { case (name, inc) =>
+      if (loadPipelinePerfNames.contains(name)) (s"LoadUnit_${i}_$name", inc) else (name, inc)
+    }
+  }
+  val perfFromUnits = perfFromLoadUnitsWithIndex ++ Seq(sbuffer, lsq, dcache).flatMap(_.getPerfEvents)
   val perfFromTLB = perfEventsDTLBld ++ perfEventsDTLBst
   val perfFromPTW = perfEventsPTW.map(x => ("PTW_" + x._1, x._2))
   val perfBlock     = Seq(("ldDeqCount", ldDeqCount),
                           ("stDeqCount", stDeqCount))
   // let index = 0 be no event
-  val allPerfEvents = Seq(("noEvent", 0.U)) ++ perfFromUnits ++ perfFromTLB ++ perfFromPTW ++ perfBlock
+  val allPerfEvents = Seq(("noEvent", 0.U)) ++ perfFromLoadPipelines ++ perfFromUnits ++
+    perfFromTLB ++ perfFromPTW ++ perfBlock
 
   if (printEventCoding) {
     for (((name, inc), i) <- allPerfEvents.zipWithIndex) {

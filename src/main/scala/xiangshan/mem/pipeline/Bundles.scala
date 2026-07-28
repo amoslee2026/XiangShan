@@ -143,6 +143,8 @@ class LoadPipeBundle(
   val matchInvalid = Option.when(param.hasS3PreProcess)(Bool())
   val shouldWakeup = Option.when(param.hasS3PreProcess)(Bool())
   val shouldWriteback = Option.when(param.hasS3PreProcess)(Bool())
+  val sqSbufferForwarded = Option.when(param.hasS3PreProcess)(Bool())
+  val sqSbufferFullForwarded = Option.when(param.hasS3PreProcess)(Bool())
   // S3 -> S4
   val hasException = Option.when(param.hasS4PreProcess)(Bool())
   val headAlwaysWriteback = Option.when(param.hasS4PreProcess)(Bool())
