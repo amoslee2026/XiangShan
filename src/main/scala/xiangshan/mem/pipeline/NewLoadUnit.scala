@@ -131,6 +131,7 @@ class LoadUnitS0(param: ExeUnitParams)(
   replay.noQuery.get := io.replay.bits.uncacheReplay.get
   replay.DontCarePAddr()
   replay.DontCareUnalign() // assign later in sink
+  replay.lrqAmbReplay.get := io.replay.bits.cause.get(C_MA)
   val replayIsHiPrio = io.replay.bits.isReplayHiPrioEntrance()
   replayHiPrio.valid := io.replay.valid && replayIsHiPrio
   replayHiPrio.bits := replay
@@ -143,6 +144,7 @@ class LoadUnitS0(param: ExeUnitParams)(
   fastReplay.bits.noQuery.get := true.B
   fastReplay.bits.entrance := io.fastReplay.bits.entrance | LoadEntrance.fastReplay.U
   fastReplay.bits.DontCareUnalign() // assign later in sink
+  fastReplay.bits.lrqAmbReplay.get := false.B
   fastReplay.bits.occupySource := VecInit(sources.map(_.valid)).asUInt // for perf
 
   // 3. low-priority replay from LRQ
@@ -494,13 +496,16 @@ class LoadUnitS0(param: ExeUnitParams)(
   XSPerfAccumulate("vector_addr_vlen_align", io.vecldin.fire && io.vecldin.bits.bankOffset() === 0.U)
   XSPerfAccumulate("vector_addr_vlen_unalign", io.vecldin.fire && io.vecldin.bits.bankOffset() =/= 0.U)
   XSPerfAccumulate("forward_tld_channel", io.replay.fire && io.replay.bits.forwardDChannel.get)
+  val loadFromLrqAmbReplay = io.replay.fire && io.replay.bits.cause.get(C_MA)
+  XSPerfAccumulate("load_from_lrq_amb_replay", loadFromLrqAmbReplay)
   XSPerfAccumulate("hardware_prefetch_fire", io.prefetchReq.fire)
   XSPerfAccumulate("software_prefetch_fire", io.ldin.fire && LSUOpType.isPrefetch(io.ldin.bits.fuOpType))
   XSPerfAccumulate("hardware_prefetch_block", io.prefetchReq.valid && !io.prefetchReq.ready)
   XSPerfAccumulate("hardware_prefetch_total", io.prefetchReq.valid)
   val perfEvents = Seq(
     ("s0_in_fire", pipeIn.fire),
-    ("s0_stall_dcache", sink.valid && !io.dcacheReq.ready)
+    ("s0_stall_dcache", sink.valid && !io.dcacheReq.ready),
+    ("load_from_lrq_amb_replay", loadFromLrqAmbReplay)
   )
   generatePerfEvent()
 
@@ -1788,17 +1793,27 @@ class LoadUnitS3(param: ExeUnitParams)(
   val loadFromSqSbufferSuccess = loadFromSqSbufferPartialData || loadFromSqSbufferFullData
   val loadSuccessfulWriteback = (io.ldout.toRob.fire || io.vecldout.fire) && !kill && demandLoad &&
     !transactionReplay && !exception && !rollbackValid
+  val lrqAmbReplay = Mux(s4HeadValid, s4Head.lrqAmbReplay.get, in.lrqAmbReplay.get)
+  val lrqAmbSqSbufferForwarded = Mux(
+    s4HeadValid,
+    s4Head.sqSbufferForwarded.get || in.sqSbufferForwarded.get,
+    in.sqSbufferForwarded.get
+  )
+  val loadFromLrqAmbForwardSuccess = pipeIn.fire && endPipe && !kill && demandLoad && lrqAmbReplay &&
+    lrqAmbSqSbufferForwarded && !transactionReplay && !exception && !rarViolation && !matchInvalid
 
   XSPerfAccumulate("load_from_sq_sbuffer_success", loadFromSqSbufferSuccess)
   XSPerfAccumulate("load_from_sq_sbuffer_partial_data", loadFromSqSbufferPartialData)
   XSPerfAccumulate("load_from_sq_sbuffer_full_data", loadFromSqSbufferFullData)
   XSPerfAccumulate("load_successful_writeback", loadSuccessfulWriteback)
+  XSPerfAccumulate("load_from_lrq_amb_forward_success", loadFromLrqAmbForwardSuccess)
 
   val perfEvents = Seq(
     ("load_from_sq_sbuffer_success", loadFromSqSbufferSuccess),
     ("load_from_sq_sbuffer_partial_data", loadFromSqSbufferPartialData),
     ("load_from_sq_sbuffer_full_data", loadFromSqSbufferFullData),
-    ("load_successful_writeback", loadSuccessfulWriteback)
+    ("load_successful_writeback", loadSuccessfulWriteback),
+    ("load_from_lrq_amb_forward_success", loadFromLrqAmbForwardSuccess)
   )
   generatePerfEvent()
 

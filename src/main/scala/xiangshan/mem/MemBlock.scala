@@ -1781,7 +1781,9 @@ class MemBlockInlinedImp(outer: MemBlockInlined) extends LazyModuleImp(outer)
     "load_from_sq_sbuffer_success",
     "load_from_sq_sbuffer_partial_data",
     "load_from_sq_sbuffer_full_data",
-    "load_successful_writeback"
+    "load_successful_writeback",
+    "load_from_lrq_amb_replay",
+    "load_from_lrq_amb_forward_success"
   )
   val perfFromLoadUnits = newLoadUnits.map(_.getPerfEvents)
   val perfFromLoadPipelines = loadPipelinePerfNames.map { name =>
