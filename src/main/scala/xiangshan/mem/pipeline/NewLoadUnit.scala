@@ -1224,7 +1224,7 @@ class LoadUnitS2(param: ExeUnitParams)(
 
   io.unalignTailValid := pipeIn.valid && isUnalignTail
 
-  io.dcacheKill := kill || exception || isUncache || isUncacheReplay
+  io.dcacheKill := kill || exception || isUncache || isUncacheReplay || !needDCacheAccess
   io.dcacheResp.ready := true.B
 
   io.rarNukeQueryReq.valid := nukeQueryReqValid && pipeIn.valid
