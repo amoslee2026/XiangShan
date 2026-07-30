@@ -687,7 +687,12 @@ class LoadQueueReplay(implicit p: Parameters) extends XSModule
                     uop(s1_oldestSel(i).bits).robIdx.needFlush(RegNext(io.redirect))
     val s0_oldestSelIndexOH = s0_oldestSel(i).bits // one-hot
     val s0_oldestSelV = s0_oldestSel(i).valid
-    s1_oldestSel(i).valid := RegEnable(s0_oldestSelV, false.B, s0_can_go)
+    // A fired request must leave s1 even when cooldown prevents accepting another selection.
+    s1_oldestSel(i).valid := RegEnable(
+      Mux(s0_can_go, s0_oldestSelV, false.B),
+      false.B,
+      s0_can_go || replay_req(i).fire
+    )
     s1_oldestSel(i).bits := RegEnable(OHToUInt(s0_oldestSel(i).bits), s0_can_go)
     vaddrModule.io.ren(i) := s0_can_go && s0_oldestSelV
     vaddrModule.io.raddr(i) := OHToUInt(s0_oldestSel(i).bits)
@@ -1034,7 +1039,8 @@ class LoadQueueReplay(implicit p: Parameters) extends XSModule
 
   val releaseTimers = VecInit(io.enq.map(enq => replayResidenceCycles(enq.bits.schedIndex)))
   // The timer contains completed cycles before the current cycle, so add the normal-release
-  // cycle to obtain T_release - T_enq. Saturated entries remain clamped at the maximum value.
+  // cycle to obtain T_release - T_enq. If the timer already reached the maximum, the exact
+  // latency is larger than the representable value and this release sample is an overflow.
   val releaseLatencies = VecInit(releaseTimers.map { timer =>
     Mux(timer === replayResidenceMax, replayResidenceMax, timer + 1.U)
   })
@@ -1051,7 +1057,9 @@ class LoadQueueReplay(implicit p: Parameters) extends XSModule
       Mux(event, latency, 0.U(replayResidenceWidth.W))
     }.reduce(_ +& _)
   }
-  val releaseCauseSaturatedCounts = releaseCauseEvents.map { events =>
+  // Count released samples whose exact latency exceeded replayResidenceMax. This is a sample
+  // count, not the number of cycles beyond the representable range.
+  val releaseCauseOverflowCounts = releaseCauseEvents.map { events =>
     PopCount(events.zip(releaseTimers).map { case (event, timer) =>
       event && timer === replayResidenceMax
     })
@@ -1100,19 +1108,22 @@ class LoadQueueReplay(implicit p: Parameters) extends XSModule
     "release cause increments must equal normal replay releases\n")
   XSError(PopCount(normalReleaseOH) =/= PopCount(normalRelease),
     "normal release entry mask must preserve the release count\n")
-  XSError(releaseCauseSaturatedCounts.reduce(_ +& _) > PopCount(normalRelease),
-    "saturated release increments must not exceed normal replay releases\n")
+  XSError(releaseCauseOverflowCounts.reduce(_ +& _) > PopCount(normalRelease),
+    "overflow release samples must not exceed normal replay releases\n")
 
+  // event counters
   LoadReplayCauses.perfCauseNames.zip(robHeadReleaseCauseCounts).foreach { case (causeName, count) =>
     XSPerfAccumulate(s"replay_${causeName}_scalar_release_rob_head", count)
   }
-  // Offline average residence latency is release_latency_cycles / release_count. Saturation is
-  // reported separately so clamped samples can be identified when interpreting that average.
+
+  // slot counters
+  // Offline average residence latency is release_latency_cycles / release_count. Overflow count
+  // reports how many released samples exceeded the representable latency.
   LoadReplayCauses.perfCauseNames.zipWithIndex.foreach { case (causeName, causeIdx) =>
     XSPerfAccumulate(s"replay_${causeName}_release_latency_cycles", releaseCauseLatencies(causeIdx))
     XSPerfAccumulate(s"replay_${causeName}_release_count", releaseCauseCounts(causeIdx))
-    XSPerfAccumulate(s"replay_${causeName}_release_latency_overflow", releaseCauseSaturatedCounts(causeIdx))
-    XSPerfAccumulate(s"replay_${causeName}_scalar_unreleased_rob_head_cycles", scalarUnreleasedRobHeadByCause(causeIdx))
+    XSPerfAccumulate(s"replay_${causeName}_release_latency_overflow_count", releaseCauseOverflowCounts(causeIdx))
+    XSPerfAccumulate(s"replay_${causeName}_scalar_rob_head_blocked_cycles", scalarUnreleasedRobHeadByCause(causeIdx))
   }
 
   val enqNumber               = PopCount(io.enq.map(enq => enq.fire && !enq.bits.isLoadReplay))
