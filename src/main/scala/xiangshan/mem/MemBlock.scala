@@ -894,11 +894,7 @@ class MemBlockInlinedImp(outer: MemBlockInlined) extends LazyModuleImp(outer)
   // LoadUnit
   for (i <- 0 until LduCnt) {
     newLoadUnits(i).io.redirect <> redirect
-<<<<<<< HEAD
     rrBankConflictFastReplay(i).grant := rrBankConflictFastReplayGrant(i)
-=======
-    newLoadUnits(i).io.perfRobHeadPtr := io.ooo_to_mem.lsqio.pendingPtrNext
->>>>>>> 120e91baa (perf(LoadUnit): add perfCounter of load execute)
 
     // get input form dispatch
     newLoadUnits(i).io.ldin <> issueLda(i)

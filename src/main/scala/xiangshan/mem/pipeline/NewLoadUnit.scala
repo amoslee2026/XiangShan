@@ -1309,7 +1309,6 @@ class LoadUnitS3(param: ExeUnitParams)(
     val redirect = Flipped(ValidIO(new Redirect))
     val kill = Input(Bool())
     val unalignTailValid = Input(Bool())
-    val perfRobHeadPtr = Input(new RobPtr)
 
     // DCache response
     val dcacheError = Input(Bool())
@@ -2018,7 +2017,6 @@ class LoadUnitDataPath(val param: ExeUnitParams)(implicit p: Parameters) extends
 class LoadUnitIO(val param: ExeUnitParams)(implicit p: Parameters) extends XSBundle {
   private val numMemChannels = p(XSCoreParamsKey).dcacheParametersOpt.get.numMemChannels
   val redirect = Flipped(ValidIO(new Redirect))
-  val perfRobHeadPtr = Input(new RobPtr)
   // Request sources
   val ldin = Flipped(DecoupledIO(new ExuInput(param, hasCopySrc = true)))
   val vecldin = Flipped(DecoupledIO(new VectorLoadIn))
@@ -2180,7 +2178,6 @@ class NewLoadUnit(val param: ExeUnitParams)(implicit p: Parameters) extends XSMo
 
   // S3
   s3.io.redirect := io.redirect
-  s3.io.perfRobHeadPtr := io.perfRobHeadPtr
   s3.io.dcacheError := io.dcache.resp.bits.error_delayed
   io.ldout <> s3.io.ldout
   io.lqWrite <> s3.io.lqWrite
