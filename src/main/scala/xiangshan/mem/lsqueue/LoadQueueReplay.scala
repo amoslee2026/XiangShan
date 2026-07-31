@@ -260,6 +260,7 @@ class LoadQueueReplay(implicit p: Parameters) extends XSModule
     val rawFull = Input(Bool())
     val l2_hint  = Input(Vec(cfg.numMemChannels, Valid(new L2ToL1Hint())))
     val tlb_hint = Flipped(new TlbHintIO)
+    val fast_tlb_hint = Flipped(ValidIO(new TLBHintResp))
     val tlbReplayDelayCycleCtrl = Vec(4, Input(UInt(ReSelectLen.W)))
 
     val debugTopDown = new LoadQueueTopDownIO
@@ -563,6 +564,11 @@ class LoadQueueReplay(implicit p: Parameters) extends XSModule
   val s0_loadHintWakeMask = VecInit((0 until LoadQueueReplaySize).map(i => {
     allocated(i) && !scheduled(i) && cause(i)(LoadReplayCauses.C_DM) && blocking(i) && l2HintHit(missMSHRId(i))
   })).asUInt
+  val s0_fastTlbHintWakeMask = VecInit((0 until LoadQueueReplaySize).map(i => {
+    allocated(i) && !scheduled(i) && cause(i)(LoadReplayCauses.C_TM) && blocking(i) &&
+      io.fast_tlb_hint.valid &&
+      (io.fast_tlb_hint.bits.replay_all || io.fast_tlb_hint.bits.id === tlbHintId(i))
+  })).asUInt
   // l2 will send 2 beats data in 2 cycles, so if data needed by this load is in first beat, select it this cycle, otherwise next cycle
   // when isKeyword = 1, s0_loadHintSelMask need overturn
     val s0_loadHintSelMask = VecInit((0 until LoadQueueReplaySize).map(i => {
@@ -581,6 +587,9 @@ class LoadQueueReplay(implicit p: Parameters) extends XSModule
     when(s0_loadHintWakeMask(i)) {
       blocking(i) := false.B
     }
+    when(s0_fastTlbHintWakeMask(i)) {
+      blocking(i) := false.B
+    }
   })
 
   // generate replay mask
@@ -595,7 +604,7 @@ class LoadQueueReplay(implicit p: Parameters) extends XSModule
   val s0_remLoadHigherPriorityReplaySelMask = VecInit((0 until LoadPipelineWidth).map(rem => getRemBits(s0_loadHigherPriorityReplaySelMask)(rem)))
   val s0_loadLowerPriorityReplaySelMask = VecInit((0 until LoadQueueReplaySize).map(i => {
     val hasLowerPriority = !cause(i)(LoadReplayCauses.C_DM) && !cause(i)(LoadReplayCauses.C_FF)
-    allocated(i) && !scheduled(i) && !blocking(i) && hasLowerPriority
+    allocated(i) && !scheduled(i) && (!blocking(i) || s0_fastTlbHintWakeMask(i)) && hasLowerPriority
   })).asUInt // use uint instead vec to reduce verilog lines
   val s0_remLoadLowerPriorityReplaySelMask = VecInit((0 until LoadPipelineWidth).map(rem => getRemBits(s0_loadLowerPriorityReplaySelMask)(rem)))
   val s0_loadNormalReplaySelMask = s0_loadLowerPriorityReplaySelMask | s0_loadHigherPriorityReplaySelMask | s0_loadHintSelMask
@@ -887,6 +896,10 @@ class LoadQueueReplay(implicit p: Parameters) extends XSModule
       when (replayInfo.cause(LoadReplayCauses.C_TM)) {
         blocking(enqIndex) := !replayInfo.tlb_full &&
           !(tlbHintResp.valid && (tlbHintResp.bits.id === replayInfo.tlb_id || tlbHintResp.bits.replay_all))
+        when (io.fast_tlb_hint.valid &&
+          (io.fast_tlb_hint.bits.id === replayInfo.tlb_id || io.fast_tlb_hint.bits.replay_all)) {
+          blocking(enqIndex) := false.B
+        }
         tlbHintId(enqIndex) := replayInfo.tlb_id
       }
 

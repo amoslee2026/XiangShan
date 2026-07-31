@@ -153,6 +153,10 @@ class PTWFilterIO(Width: Int, hasHint: Boolean = false)(implicit p: Parameters) 
 
 }
 
+class PTWNewFilterIO(Width: Int)(implicit p: Parameters) extends PTWFilterIO(Width, hasHint = true) {
+  val fastHint = ValidIO(new TLBHintResp)
+}
+
 class PTWFilterEntryIO(Width: Int, hasHint: Boolean = false)(implicit p: Parameters) extends PTWFilterIO(Width, hasHint){
   val flush = Input(Bool())
   val refill = Output(Bool())
@@ -334,7 +338,7 @@ class PTWNewFilter(Width: Int, Size: Int, FenceDelay: Int)(implicit p: Parameter
   // all store address execute units, including sta and hyu
   private val StaExuCnt = backendParams.StaExuCnt
 
-  val io = IO(new PTWFilterIO(Width, hasHint = true))
+  val io = IO(new PTWNewFilterIO(Width))
 
   val load_filter = VecInit(Seq.fill(1) {
     val load_entry = Module(new PTWFilterEntry(Width = LdExuCnt + PfNumInDtlbLD, Size = loadfiltersize, hasHint = true))
@@ -394,6 +398,7 @@ class PTWNewFilter(Width: Int, Size: Int, FenceDelay: Int)(implicit p: Parameter
 
   val hintIO = io.hint.getOrElse(new TlbHintIO)
   val load_hintIO = load_filter(0).hint.getOrElse(new TlbHintIO)
+  io.fastHint := load_hintIO.resp
   for (i <- 0 until LdExuCnt) {
     hintIO.req(i) := RegNext(load_hintIO.req(i))
   }
