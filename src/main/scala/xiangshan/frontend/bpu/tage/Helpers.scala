@@ -19,6 +19,7 @@ import chisel3._
 import chisel3.util._
 import utils.AddrField
 import xiangshan.frontend.PrunedAddr
+import xiangshan.frontend.bpu.FoldedHistoryInfo
 import xiangshan.frontend.bpu.SaturateCounter
 import xiangshan.frontend.bpu.SaturateCounterInit
 import xiangshan.frontend.bpu.TageTableInfo
@@ -31,28 +32,56 @@ trait TopHelper extends HasTageParameters {
       runtimeConfig:     TageRuntimeConfig
   ): Seq[TageFoldedHist] = {
     require(tableConfigs.length == NumTables)
-    TableInfos.zip(tableConfigs).map { case (tableInfo, tableConfig) =>
+    TableInfos.zip(tableConfigs).zipWithIndex.map { case ((tableInfo, tableConfig), tableIdx) =>
       val physicalTableInfo = new TageTableInfo(
         MaxNumSetsLog2,
         MaxNumWays,
         tableInfo.HistoryLength
       )
-      val candidates = for {
-        numSets  <- SupportedNumSets
-        tagWidth <- SupportedTagWidths
-      } yield {
-        val candidateInfo =
-          new TageTableInfo(log2Ceil(numSets), tableInfo.NumWays, tableInfo.HistoryLength)
-        val tageFoldedHist = candidateInfo.getTageFoldedHistoryInfo(tagWidth).map { histInfo =>
-          allFoldedPathHist.getHistWithInfo(histInfo).foldedHist
+
+      val selectedHistoryLength = MuxCase(
+        tableInfo.HistoryLength.U,
+        SupportedHistoryProfiles.zipWithIndex.map { case (profile, profileIdx) =>
+          (runtimeConfig.historyProfile === profileIdx.U) -> profile.TableHistoryLengths(tableIdx).U
         }
-        val foldedHist = Wire(new TageFoldedHist()(p, physicalTableInfo))
-        foldedHist.forIdx    := tageFoldedHist.head
-        foldedHist.forTag(0) := tageFoldedHist(1)
-        foldedHist.forTag(1) := Cat(tageFoldedHist(2), 0.U(1.W))
-        (tableConfig.numSetsLog2 === log2Ceil(numSets).U && runtimeConfig.tagWidth === tagWidth.U) -> foldedHist
+      )
+      val supportedTableHistoryLengths =
+        SupportedHistoryProfiles.map(_.TableHistoryLengths(tableIdx)).distinct
+
+      def getFoldedHistory(historyLength: Int, foldedLength: Int): UInt =
+        allFoldedPathHist
+          .getHistWithInfo(new FoldedHistoryInfo(historyLength, math.min(historyLength, foldedLength)))
+          .foldedHist
+
+      val idxCandidates = for {
+        historyLength <- supportedTableHistoryLengths
+        numSetsLog2   <- SupportedNumSetsLog2
+      } yield {
+        val selected = selectedHistoryLength === historyLength.U && tableConfig.numSetsLog2 === numSetsLog2.U
+        selected -> getFoldedHistory(historyLength, numSetsLog2)
       }
-      MuxCase(candidates.head._2, candidates)
+
+      val tagCandidates = for {
+        historyLength <- supportedTableHistoryLengths
+        tagWidth      <- SupportedTagWidths
+      } yield {
+        val selected  = selectedHistoryLength === historyLength.U && runtimeConfig.tagWidth === tagWidth.U
+        val forTag    = getFoldedHistory(historyLength, tagWidth)
+        val forAltTag = Cat(getFoldedHistory(historyLength, tagWidth - 1), 0.U(1.W))
+        selected -> (forTag, forAltTag)
+      }
+
+      val foldedHist = Wire(new TageFoldedHist()(p, physicalTableInfo))
+      foldedHist.forIdx := MuxCase(idxCandidates.head._2, idxCandidates)
+      foldedHist.forTag(0) := MuxCase(
+        tagCandidates.head._2._1,
+        tagCandidates.map { case (sel, tags) => sel -> tags._1 }
+      )
+      foldedHist.forTag(1) := MuxCase(
+        tagCandidates.head._2._2,
+        tagCandidates.map { case (sel, tags) => sel -> tags._2 }
+      )
+      foldedHist
     }
   }
 
@@ -98,9 +127,93 @@ trait TopHelper extends HasTageParameters {
     )
   }
 
-  def getUseAltOnNaIdx(pc: PrunedAddr): UInt = {
-    val useAltOnNaIdxWidth = log2Ceil(NumUseAltOnNa)
-    pc(useAltOnNaIdxWidth - 1 + instOffsetBits, instOffsetBits)
+  def getActiveUsefulResetCtrWidth(requestedWidth: UInt): UInt =
+    Mux(
+      requestedWidth < tageParameters.MinUsefulResetCtrWidth.U,
+      tageParameters.MinUsefulResetCtrWidth.U,
+      Mux(
+        requestedWidth > tageParameters.MaxUsefulResetCtrWidth.U,
+        tageParameters.MaxUsefulResetCtrWidth.U,
+        requestedWidth
+      )
+    )
+
+  def getActiveUsefulResetCtrValue(counter: SaturateCounter, requestedWidth: UInt): UInt = {
+    val width = getActiveUsefulResetCtrWidth(requestedWidth)
+    counter.value & ((1.U((UsefulResetCtrWidth + 1).W) << width) - 1.U)(UsefulResetCtrWidth - 1, 0)
+  }
+
+  def usefulResetCtrIsSaturatePositive(counter: SaturateCounter, requestedWidth: UInt): Bool = {
+    val width    = getActiveUsefulResetCtrWidth(requestedWidth)
+    val maxValue = ((1.U((UsefulResetCtrWidth + 1).W) << width) - 1.U)(UsefulResetCtrWidth - 1, 0)
+    getActiveUsefulResetCtrValue(counter, requestedWidth) === maxValue
+  }
+
+  def getUsefulResetCtrIncrease(counter: SaturateCounter, requestedWidth: UInt): SaturateCounter = {
+    val value = getActiveUsefulResetCtrValue(counter, requestedWidth)
+    SaturateCounterInit(
+      UsefulResetCtrWidth,
+      Mux(usefulResetCtrIsSaturatePositive(counter, requestedWidth), value, value + 1.U)
+    )
+  }
+
+  def getActiveUseAltOnNaWidth(requestedWidth: UInt): UInt =
+    Mux(
+      requestedWidth < tageParameters.MinUseAltOnNaWidth.U,
+      tageParameters.MinUseAltOnNaWidth.U,
+      Mux(
+        requestedWidth > tageParameters.MaxUseAltOnNaWidth.U,
+        tageParameters.MaxUseAltOnNaWidth.U,
+        requestedWidth
+      )
+    )
+
+  def getActiveUseAltOnNaValue(counter: SaturateCounter, requestedWidth: UInt): UInt = {
+    val width = getActiveUseAltOnNaWidth(requestedWidth)
+    counter.value & ((1.U((UseAltOnNaWidth + 1).W) << width) - 1.U)(UseAltOnNaWidth - 1, 0)
+  }
+
+  def useAltOnNaIsPositive(counter: SaturateCounter, requestedWidth: UInt): Bool = {
+    val width    = getActiveUseAltOnNaWidth(requestedWidth)
+    val signMask = (1.U((UseAltOnNaWidth + 1).W) << (width - 1.U))(UseAltOnNaWidth - 1, 0)
+    (getActiveUseAltOnNaValue(counter, requestedWidth) & signMask).orR
+  }
+
+  def getUseAltOnNaUpdate(
+      counter:        SaturateCounter,
+      requestedWidth: UInt,
+      increase:       Bool,
+      decrease:       Bool
+  ): SaturateCounter = {
+    val width    = getActiveUseAltOnNaWidth(requestedWidth)
+    val value    = getActiveUseAltOnNaValue(counter, requestedWidth)
+    val maxValue = ((1.U((UseAltOnNaWidth + 1).W) << width) - 1.U)(UseAltOnNaWidth - 1, 0)
+    SaturateCounterInit(
+      UseAltOnNaWidth,
+      Mux(
+        increase && value =/= maxValue,
+        value + 1.U,
+        Mux(decrease && value.orR, value - 1.U, value)
+      )
+    )
+  }
+
+  def getActiveNumUseAltOnNa(requestedNum: UInt): UInt =
+    Mux(
+      requestedNum < tageParameters.MinNumUseAltOnNa.U,
+      tageParameters.MinNumUseAltOnNa.U,
+      Mux(
+        requestedNum > tageParameters.MaxNumUseAltOnNa.U,
+        tageParameters.MaxNumUseAltOnNa.U,
+        requestedNum
+      )
+    )
+
+  def getUseAltOnNaIdx(pc: PrunedAddr, requestedNum: UInt): UInt = {
+    val useAltOnNaIdxWidth = log2Ceil(NumUseAltOnNa).max(1)
+    val rawIdx             = pc(useAltOnNaIdxWidth - 1 + instOffsetBits, instOffsetBits)
+    val activeMask         = (getActiveNumUseAltOnNa(requestedNum) - 1.U)(useAltOnNaIdxWidth - 1, 0)
+    rawIdx & activeMask
   }
 }
 

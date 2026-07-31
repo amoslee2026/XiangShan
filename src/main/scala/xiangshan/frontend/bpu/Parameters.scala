@@ -25,6 +25,7 @@ import xiangshan.frontend.bpu.ittage.IttageParameters
 import xiangshan.frontend.bpu.mbtb.MainBtbParameters
 import xiangshan.frontend.bpu.ras.RasParameters
 import xiangshan.frontend.bpu.sc.ScParameters
+import xiangshan.frontend.bpu.tage.TageHistoryDseParameters
 import xiangshan.frontend.bpu.tage.TageParameters
 import xiangshan.frontend.bpu.ubtb.MicroBtbParameters
 import xiangshan.frontend.bpu.utage.MicroTageParameters
@@ -42,11 +43,16 @@ case class BpuParameters(
     phrParameters:      PhrParameters = PhrParameters(),
     commonHRParameters: CommonHRParameters = CommonHRParameters(),
     // sub predictors
-    ubtbParameters:   MicroBtbParameters = MicroBtbParameters(),
-    abtbParameters:   AheadBtbParameters = AheadBtbParameters(),
-    utageParameters:  MicroTageParameters = MicroTageParameters(),
-    mbtbParameters:   MainBtbParameters = MainBtbParameters(),
-    tageParameters:   TageParameters = TageParameters(),
+    ubtbParameters:  MicroBtbParameters = MicroBtbParameters(),
+    abtbParameters:  AheadBtbParameters = AheadBtbParameters(),
+    utageParameters: MicroTageParameters = MicroTageParameters(),
+    mbtbParameters:  MainBtbParameters = MainBtbParameters(),
+    tageParameters: TageParameters = TageParameters(
+      HistoryDse = Some(TageHistoryDseParameters(
+        MinHistoryLengths = Seq(4, 5, 6, 7, 8),
+        MaxHistoryLengths = Seq(397, 300, 350, 400, 450, 500, 550, 600)
+      ))
+    ),
     scParameters:     ScParameters = ScParameters(),
     ittageParameters: IttageParameters = IttageParameters(),
     rasParameters:    RasParameters = RasParameters()
@@ -81,13 +87,15 @@ trait HasBpuParameters extends HasFrontendParameters {
   def CompareAddrLowWidth: Int = bpuParameters.mbtbParameters.TargetWidth
 
   // phr history
-  def AllFoldedHistoryInfo: Set[FoldedHistoryInfo] =
-    bpuParameters.tageParameters.TableInfos.flatMap { info =>
-      val tage = bpuParameters.tageParameters
-      Iterator.iterate(tage.MinNumSets)(_ * 2).takeWhile(_ <= tage.MaxNumSets).flatMap { numSets =>
-        (tage.MinTagWidth to tage.MaxTagWidth).flatMap { tagWidth =>
-          new TageTableInfo(log2Ceil(numSets), info.NumWays, info.HistoryLength)
-            .getFoldedHistoryInfoSet(tagWidth)
+  def AllFoldedHistoryInfo: Set[FoldedHistoryInfo] = {
+    val tage = bpuParameters.tageParameters
+    tage.SupportedHistoryProfiles.flatMap { profile =>
+      tage.TableInfos.zip(profile.TableHistoryLengths).flatMap { case (info, historyLength) =>
+        (tage.MinNumSetsLog2 to tage.MaxNumSetsLog2).flatMap { numSetsLog2 =>
+          (tage.MinTagWidth to tage.MaxTagWidth).flatMap { tagWidth =>
+            new TageTableInfo(numSetsLog2, info.NumWays, historyLength)
+              .getFoldedHistoryInfoSet(tagWidth)
+          }
         }
       }
     }.toSet ++
@@ -100,6 +108,7 @@ trait HasBpuParameters extends HasFrontendParameters {
       bpuParameters.utageParameters.TableInfos.map {
         _.getFoldedHistoryInfoSet()
       }.reduce(_ ++ _)
+  }
 
   // sanity check
   // should do this check in `case class BpuParameters` constructor, but we don't have access to `FetchBlockSize` there

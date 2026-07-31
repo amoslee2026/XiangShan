@@ -272,6 +272,36 @@ class Bpu(implicit p: Parameters) extends BpuModule with HalfAlignHelper {
       tageRuntimeConfig.usefulCtrWidth.getWidth - 1,
       0
     )
+  tageRuntimeConfig.usefulResetCtrWidth := Constantin
+    .createRecord(s"tageUsefulResetCtrWidth_${hartId}", initValue = bpuParameters.tageParameters.UsefulResetCtrWidth)(
+      tageRuntimeConfig.usefulResetCtrWidth.getWidth - 1,
+      0
+    )
+  tageRuntimeConfig.useAltOnNaWidth := Constantin
+    .createRecord(s"tageUseAltOnNaWidth_${hartId}", initValue = bpuParameters.tageParameters.UseAltOnNaWidth)(
+      tageRuntimeConfig.useAltOnNaWidth.getWidth - 1,
+      0
+    )
+  tageRuntimeConfig.numUseAltOnNa := Constantin
+    .createRecord(s"tageNumUseAltOnNa_${hartId}", initValue = bpuParameters.tageParameters.NumUseAltOnNa)(
+      tageRuntimeConfig.numUseAltOnNa.getWidth - 1,
+      0
+    )
+  private val requestedMinHistoryLength = Constantin.createRecord(
+    s"tageHistoryMin_${hartId}",
+    initValue = bpuParameters.tageParameters.DefaultHistoryProfile.MinHistoryLength
+  )
+  private val requestedMaxHistoryLength = Constantin.createRecord(
+    s"tageHistoryMax_${hartId}",
+    initValue = bpuParameters.tageParameters.DefaultHistoryProfile.MaxHistoryLength
+  )
+  private val historyProfileMatches = VecInit(bpuParameters.tageParameters.SupportedHistoryProfiles.map { profile =>
+    requestedMinHistoryLength === profile.MinHistoryLength.U &&
+    requestedMaxHistoryLength === profile.MaxHistoryLength.U
+  })
+  assert(PopCount(historyProfileMatches) === 1.U, "unsupported TAGE geometric history range")
+  tageRuntimeConfig.historyProfile := (if (bpuParameters.tageParameters.SupportedHistoryProfiles.length == 1) 0.U
+                                       else OHToUInt(historyProfileMatches))
 
   tage.io.fromMainBtb.result             := mbtb.io.result
   tage.io.fromMainBtb.s1_positions       := mbtb.io.s1_positions

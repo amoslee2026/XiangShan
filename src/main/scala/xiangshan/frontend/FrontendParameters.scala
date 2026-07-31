@@ -40,7 +40,7 @@ case class FrontendParameters(
     def nextMultipleOf(number: Int, factor: Int): Int = (number + factor - 1) / factor * factor
 
     def MaxTableHistoryLength: Int = (
-      bpuParameters.tageParameters.TableInfos.map(_.HistoryLength) ++
+      Seq(bpuParameters.tageParameters.MaxSupportedHistoryLength) ++
         bpuParameters.ittageParameters.TableInfos.map(_.HistoryLength) ++
         bpuParameters.scParameters.PathTableInfos.map(_.HistoryLength)
     ).max

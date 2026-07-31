@@ -69,8 +69,12 @@ class Tage(implicit p: Parameters) extends BasePredictor with HasTageParameters 
 
   private val s0_tableConfigs  = Wire(Vec(NumTables, new TageTableConfig))
   private val s0_runtimeConfig = Wire(new TageRuntimeConfig)
-  s0_runtimeConfig.tagWidth       := getActiveTagWidth(io.runtimeConfig.tagWidth)
-  s0_runtimeConfig.usefulCtrWidth := getActiveUsefulCtrWidth(io.runtimeConfig.usefulCtrWidth)
+  s0_runtimeConfig.tagWidth            := getActiveTagWidth(io.runtimeConfig.tagWidth)
+  s0_runtimeConfig.usefulCtrWidth      := getActiveUsefulCtrWidth(io.runtimeConfig.usefulCtrWidth)
+  s0_runtimeConfig.usefulResetCtrWidth := getActiveUsefulResetCtrWidth(io.runtimeConfig.usefulResetCtrWidth)
+  s0_runtimeConfig.useAltOnNaWidth     := getActiveUseAltOnNaWidth(io.runtimeConfig.useAltOnNaWidth)
+  s0_runtimeConfig.numUseAltOnNa       := getActiveNumUseAltOnNa(io.runtimeConfig.numUseAltOnNa)
+  s0_runtimeConfig.historyProfile      := io.runtimeConfig.historyProfile
   tables.zip(io.tableConfigs).zip(s0_tableConfigs).zipWithIndex.foreach {
     case (((table, requested), active), tableIdx) =>
       active.numSetsLog2 := table.getActiveNumSetsLog2(requested.numSetsLog2)
@@ -96,6 +100,29 @@ class Tage(implicit p: Parameters) extends BasePredictor with HasTageParameters 
     assert(
       io.runtimeConfig.usefulCtrWidth === 1.U || io.runtimeConfig.usefulCtrWidth === 2.U,
       "TAGE active useful counter width must be 1 or 2"
+    )
+    assert(
+      io.runtimeConfig.usefulResetCtrWidth >= tageParameters.MinUsefulResetCtrWidth.U &&
+        io.runtimeConfig.usefulResetCtrWidth <= tageParameters.MaxUsefulResetCtrWidth.U,
+      "TAGE active useful-reset counter width is outside the supported range"
+    )
+    assert(
+      io.runtimeConfig.useAltOnNaWidth >= tageParameters.MinUseAltOnNaWidth.U &&
+        io.runtimeConfig.useAltOnNaWidth <= tageParameters.MaxUseAltOnNaWidth.U,
+      "TAGE active use-alt counter width is outside the supported range"
+    )
+    assert(
+      io.runtimeConfig.numUseAltOnNa >= tageParameters.MinNumUseAltOnNa.U &&
+        io.runtimeConfig.numUseAltOnNa <= tageParameters.MaxNumUseAltOnNa.U,
+      "TAGE active number of use-alt counters is outside the supported range"
+    )
+    assert(
+      (io.runtimeConfig.numUseAltOnNa & (io.runtimeConfig.numUseAltOnNa - 1.U)) === 0.U,
+      "TAGE active number of use-alt counters must be a power of two"
+    )
+    assert(
+      io.runtimeConfig.historyProfile < SupportedHistoryProfiles.length.U,
+      "TAGE history profile is outside the supported geometric history range"
     )
   }
 
@@ -158,8 +185,11 @@ class Tage(implicit p: Parameters) extends BasePredictor with HasTageParameters 
   s2_branches.zipWithIndex.foreach { case (branch, i) =>
     val position      = branch.bits.cfiPosition
     val cfiPc         = getCfiPcFromPosition(s2_startPc, position)
-    val useAltOnNaIdx = getUseAltOnNaIdx(cfiPc)
-    val useAltOnNa    = useAltOnNaVec(useAltOnNaIdx).isPositive
+    val useAltOnNaIdx = getUseAltOnNaIdx(cfiPc, s2_runtimeConfig.numUseAltOnNa)
+    val useAltOnNa = useAltOnNaIsPositive(
+      useAltOnNaVec(useAltOnNaIdx),
+      s2_runtimeConfig.useAltOnNaWidth
+    )
 
     // compare tags of each branch with all tables
     val allTableTagMatchResults = s2_readResp.zipWithIndex.map { case (tableReadResp, tableIdx) =>
@@ -372,7 +402,7 @@ class Tage(implicit p: Parameters) extends BasePredictor with HasTageParameters 
 
   private val t2_cfiUseAltOnNaIdxVec = VecInit(t2_branches.map { branch =>
     val cfiPc = getCfiPcFromPosition(t2_startPc, branch.bits.cfiPosition)
-    getUseAltOnNaIdx(cfiPc)
+    getUseAltOnNaIdx(cfiPc, t2_runtimeConfig.numUseAltOnNa)
   })
 
   private val t2_trainInfoVec = VecInit(t2_branches.zipWithIndex.map { case (branch, i) =>
@@ -382,7 +412,10 @@ class Tage(implicit p: Parameters) extends BasePredictor with HasTageParameters 
     val position      = branch.bits.cfiPosition
     val actualTaken   = branch.bits.taken
     val useAltOnNaIdx = t2_cfiUseAltOnNaIdxVec(i)
-    val useAltOnNa    = useAltOnNaVec(useAltOnNaIdx).isPositive
+    val useAltOnNa = useAltOnNaIsPositive(
+      useAltOnNaVec(useAltOnNaIdx),
+      t2_runtimeConfig.useAltOnNaWidth
+    )
 
     val allTableTagMatchResults = t2_readResp.zipWithIndex.map { case (tableReadResp, tableIdx) =>
       val tag           = t2_rawTag(tableIdx) ^ position
@@ -604,7 +637,9 @@ class Tage(implicit p: Parameters) extends BasePredictor with HasTageParameters 
     entry
   }
 
-  private val t3_usefulResetStart = t3_fire && usefulResetCtr.isSaturatePositive && !usefulResetInFlight
+  private val t3_usefulResetStart = t3_fire &&
+    usefulResetCtrIsSaturatePositive(usefulResetCtr, t3_runtimeConfig.usefulResetCtrWidth) &&
+    !usefulResetInFlight
 
   tables.zipWithIndex.foreach { case (table, tableIdx) =>
     implicit val info: TageTableInfo = TableInfos(tableIdx)
@@ -687,7 +722,7 @@ class Tage(implicit p: Parameters) extends BasePredictor with HasTageParameters 
   when(t3_usefulResetStart) {
     usefulResetCtr.resetZero()
   }.elsewhen(t3_fire && t3_needAllocate && !t3_canAllocate && !usefulResetInFlight) {
-    usefulResetCtr.selfIncrease()
+    usefulResetCtr := getUsefulResetCtrIncrease(usefulResetCtr, t3_runtimeConfig.usefulResetCtrWidth)
   }
 
   useAltOnNaVec.zipWithIndex.map { case (ctr, i) =>
@@ -706,10 +741,8 @@ class Tage(implicit p: Parameters) extends BasePredictor with HasTageParameters 
       assert(PopCount(decreaseMask) <= 1.U)
       assert(!(increase && decrease))
 
-      when(increase) {
-        ctr.selfIncrease()
-      }.elsewhen(decrease) {
-        ctr.selfDecrease()
+      when(increase || decrease) {
+        ctr := getUseAltOnNaUpdate(ctr, t3_runtimeConfig.useAltOnNaWidth, increase, decrease)
       }
     }
   }

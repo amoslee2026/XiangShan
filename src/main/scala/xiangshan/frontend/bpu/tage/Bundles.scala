@@ -43,12 +43,12 @@ object UsefulCounter extends SaturateCounterFactory {
 
 object UsefulResetCounter extends SaturateCounterFactory {
   def width(implicit p: Parameters): Int =
-    p(XSCoreParamsKey).frontendParameters.bpuParameters.tageParameters.UsefulResetCtrWidth
+    p(XSCoreParamsKey).frontendParameters.bpuParameters.tageParameters.MaxUsefulResetCtrWidth
 }
 
 object UseAltOnNaCounter extends SaturateCounterFactory {
   def width(implicit p: Parameters): Int =
-    p(XSCoreParamsKey).frontendParameters.bpuParameters.tageParameters.UseAltOnNaWidth
+    p(XSCoreParamsKey).frontendParameters.bpuParameters.tageParameters.MaxUseAltOnNaWidth
 }
 
 class TageEntry(implicit p: Parameters) extends TageBundle {
@@ -126,8 +126,12 @@ class TageTableConfig(implicit p: Parameters) extends TageBundle {
 }
 
 class TageRuntimeConfig(implicit p: Parameters) extends TageBundle {
-  val tagWidth:       UInt = UInt(ActiveTagWidthWidth.W)
-  val usefulCtrWidth: UInt = UInt(ActiveUsefulCtrWidthWidth.W)
+  val tagWidth:            UInt = UInt(ActiveTagWidthWidth.W)
+  val usefulCtrWidth:      UInt = UInt(ActiveUsefulCtrWidthWidth.W)
+  val usefulResetCtrWidth: UInt = UInt(ActiveUsefulResetCtrWidthWidth.W)
+  val useAltOnNaWidth:     UInt = UInt(ActiveUseAltOnNaWidthWidth.W)
+  val numUseAltOnNa:       UInt = UInt(ActiveNumUseAltOnNaWidth.W)
+  val historyProfile:      UInt = UInt(ActiveHistoryProfileWidth.W)
 }
 
 class TageMeta(implicit p: Parameters) extends TageBundle {
