@@ -265,12 +265,10 @@ class AtomicsUnit(val param: ExeUnitParams)(implicit p: Parameters) extends XSMo
         LSUOpType.AMOSize.D.U -> (vaddr(2,0) === 0.U),
         LSUOpType.AMOSize.Q.U -> (vaddr(3,0) === 0.U)
       ))
-      exceptionVec(loadAddrMisaligned)  := !addrAligned && isLr
-      exceptionVec(storeAddrMisaligned) := !addrAligned && !isLr
       exceptionVec(storePageFault)      := io.dtlb.resp.bits.excp(0).pf.st
       exceptionVec(loadPageFault)       := io.dtlb.resp.bits.excp(0).pf.ld
-      exceptionVec(storeAccessFault)    := io.dtlb.resp.bits.excp(0).af.st
-      exceptionVec(loadAccessFault)     := io.dtlb.resp.bits.excp(0).af.ld
+      exceptionVec(storeAccessFault)    := io.dtlb.resp.bits.excp(0).af.st || !addrAligned && !isLr
+      exceptionVec(loadAccessFault)     := io.dtlb.resp.bits.excp(0).af.ld || !addrAligned && isLr
       exceptionVec(storeGuestPageFault) := io.dtlb.resp.bits.excp(0).gpf.st
       exceptionVec(loadGuestPageFault)  := io.dtlb.resp.bits.excp(0).gpf.ld
 
