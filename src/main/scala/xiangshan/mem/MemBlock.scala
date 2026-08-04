@@ -1007,6 +1007,8 @@ class MemBlockInlinedImp(outer: MemBlockInlined) extends LazyModuleImp(outer)
     newLoadUnits(i).io.csrTrigger.debugMode := debugMode
   }
 
+  lsq.io.fast_tlb_hint <> dtlbRepeater.io.fastHint
+
   lsq.io.cmoOpReq <> dcache.io.cmoOpReq
   lsq.io.cmoOpResp <> dcache.io.cmoOpResp
 

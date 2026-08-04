@@ -260,6 +260,7 @@ class LoadQueueReplay(implicit p: Parameters) extends XSModule
     val rawFull = Input(Bool())
     val l2_hint  = Input(Vec(cfg.numMemChannels, Valid(new L2ToL1Hint())))
     val tlb_hint = Flipped(new TlbHintIO)
+    val fast_tlb_hint = Flipped(ValidIO(new TLBHintResp))
     val tlbReplayDelayCycleCtrl = Vec(4, Input(UInt(ReSelectLen.W)))
 
     val debugTopDown = new LoadQueueTopDownIO
@@ -343,9 +344,9 @@ class LoadQueueReplay(implicit p: Parameters) extends XSModule
   val storeDataWakeupCancel = VecInit(io.storeDataWakeupCancel.map(cancel => RegNext(cancel, 0.U.asTypeOf(cancel))))
   val loadWakeup = VecInit(io.loadWakeup.map(delayWakeup(_)))
   val loadWakeupPrev = VecInit(loadWakeup.map(delayWakeup(_)))
-  // Select C_TM replays from the repeater hint directly; keep the delayed copy as fallback.
-  val directTlbHintResp = io.tlb_hint.resp
-  val tlbHintResp = delayWakeup(directTlbHintResp)
+  // Fast hint selects C_TM replays directly. The delayed original hint remains the fallback.
+  val fastTlbHintResp = io.fast_tlb_hint
+  val tlbHintResp = delayWakeup(io.tlb_hint.resp)
   val l2Hint = VecInit(io.l2_hint.map(delayWakeup(_)))
   val mmioWakeup = delayWakeup(io.mmioWakeup)
   val ncWakeup = delayWakeup(io.ncWakeup)
@@ -567,8 +568,7 @@ class LoadQueueReplay(implicit p: Parameters) extends XSModule
   })).asUInt
   val s0_tlbHintWakeMask = VecInit((0 until LoadQueueReplaySize).map(i => {
     allocated(i) && !scheduled(i) && cause(i)(LoadReplayCauses.C_TM) && blocking(i) &&
-      directTlbHintResp.valid &&
-      (directTlbHintResp.bits.replay_all || directTlbHintResp.bits.id === tlbHintId(i))
+      fastTlbHintResp.valid && fastTlbHintResp.bits.id === tlbHintId(i)
   })).asUInt
   // l2 will send 2 beats data in 2 cycles, so if data needed by this load is in first beat, select it this cycle, otherwise next cycle
   // when isKeyword = 1, s0_loadHintSelMask need overturn
@@ -897,8 +897,7 @@ class LoadQueueReplay(implicit p: Parameters) extends XSModule
       when (replayInfo.cause(LoadReplayCauses.C_TM)) {
         blocking(enqIndex) := !replayInfo.tlb_full &&
           !(tlbHintResp.valid && (tlbHintResp.bits.id === replayInfo.tlb_id || tlbHintResp.bits.replay_all))
-        when (directTlbHintResp.valid &&
-          (directTlbHintResp.bits.id === replayInfo.tlb_id || directTlbHintResp.bits.replay_all)) {
+        when (fastTlbHintResp.valid && fastTlbHintResp.bits.id === replayInfo.tlb_id) {
           blocking(enqIndex) := false.B
         }
         tlbHintId(enqIndex) := replayInfo.tlb_id
