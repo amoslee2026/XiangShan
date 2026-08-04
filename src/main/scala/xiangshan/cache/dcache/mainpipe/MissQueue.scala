@@ -1163,6 +1163,7 @@ for(i <- 0 until reqNum) {
 class MissQueue(edge: TLEdgeOut, reqNum: Int)(implicit p: Parameters) extends DCacheModule
   with HasPerfEvents
   with HasMissReqFunction
+  with HasCircularQueuePtrHelper
   {
   val io = IO(new Bundle {
     val hartId = Input(UInt(hartIdLen.W))
@@ -1368,6 +1369,18 @@ class MissQueue(edge: TLEdgeOut, reqNum: Int)(implicit p: Parameters) extends DC
     }.reduce(_ || _)
   }
 
+  // Resolve compression leaders before allocation ordering. Keeping this result
+  // independent of analysis avoids feeding the selected MSHR back into the
+  // needs-allocation calculation.
+  val compress_group_id = WireInit(VecInit((0 until reqNum).map(i => i.U(log2Up(reqNum).W))))
+  for (i <- 0 until reqNum) {
+    for (j <- (0 until i).reverse) {
+      when (addr_conflicts(i)(j)) {
+        compress_group_id(i) := j.U
+      }
+    }
+  }
+
   for(i <- 0 until reqNum) {
     can_merge_from_pipe_mshr(i) := 0.U
 
@@ -1419,7 +1432,7 @@ class MissQueue(edge: TLEdgeOut, reqNum: Int)(implicit p: Parameters) extends DC
     when (req_valid) {
       when (has_addr_conflict) {
         // Compress case: needs allocation if can_allocate (and cannot merge/reject)
-        needs_allocate(i) := can_allocate_vec(i) && (analysis.compress_group(i) === i.U)
+        needs_allocate(i) := can_allocate_vec(i) && (compress_group_id(i) === i.U)
       }.elsewhen (can_allocate_vec(i)) {
         // Allocate only case
         needs_allocate(i) := true.B
@@ -1435,6 +1448,49 @@ class MissQueue(edge: TLEdgeOut, reqNum: Int)(implicit p: Parameters) extends DC
     } else {
       val prev_count = alloc_order(i - 1)
       alloc_order(i) := Mux(needs_allocate(i - 1), prev_count + 1.U, prev_count)
+    }
+  }
+
+  // Keep the allocation slots of non-load requests unchanged. Load requests only
+  // exchange the slots originally occupied by loads, with older lqIdx taking the
+  // smaller slot (and therefore the smaller free MSHR ID).
+  val load_needs_allocate = VecInit((0 until reqNum).map { i =>
+    needs_allocate(i) && io.queryMQ(i).req.bits.isFromLoad
+  })
+
+  val load_port_order = WireInit(VecInit(Seq.fill(reqNum)(0.U(log2Up(reqNum + 1).W))))
+  for (i <- 0 until reqNum) {
+    if (i == 0) {
+      load_port_order(i) := 0.U
+    } else {
+      load_port_order(i) := PopCount(load_needs_allocate.take(i))
+    }
+  }
+
+  // load_alloc_slots(k) is the original allocation slot of the k-th load port.
+  val load_alloc_slots = WireInit(VecInit(Seq.fill(reqNum)(0.U(log2Up(reqNum + 1).W))))
+  for (slot <- 0 until reqNum) {
+    for (i <- 0 until reqNum) {
+      when (load_needs_allocate(i) && load_port_order(i) === slot.U) {
+        load_alloc_slots(slot) := alloc_order(i)
+      }
+    }
+  }
+
+  val load_age_order = WireInit(VecInit(Seq.fill(reqNum)(0.U(log2Up(reqNum + 1).W))))
+  for (i <- 0 until reqNum) {
+    val older_loads = (0 until reqNum).map { j =>
+      val lqIdxIsOlder = isBefore(io.queryMQ(j).req.bits.lqIdx, io.queryMQ(i).req.bits.lqIdx)
+      val sameLqIdxAndEarlierPort = io.queryMQ(j).req.bits.lqIdx === io.queryMQ(i).req.bits.lqIdx && (j < i).B
+      load_needs_allocate(j) && (lqIdxIsOlder || sameLqIdxAndEarlierPort)
+    }
+    load_age_order(i) := PopCount(older_loads)
+  }
+
+  val sorted_alloc_order = WireInit(alloc_order)
+  for (i <- 0 until reqNum) {
+    when (load_needs_allocate(i)) {
+      sorted_alloc_order(i) := load_alloc_slots(load_age_order(i))
     }
   }
 
@@ -1464,14 +1520,7 @@ class MissQueue(edge: TLEdgeOut, reqNum: Int)(implicit p: Parameters) extends DC
     when (req_valid) {
       when (addr_conflicts(i).asUInt.orR) {
         // Use lowest index among conflicting requests as group ID
-        val conflict_group_id = WireInit(i.U(log2Up(reqNum).W))
-
-        // Check all smaller indices for conflicts
-        for (j <- (0 until i).reverse) {
-          when (addr_conflicts(i)(j)) {
-            conflict_group_id := j.U
-          }
-        }
+        val conflict_group_id = compress_group_id(i)
 
         analysis.compress_group(i) := conflict_group_id
 
@@ -1486,11 +1535,11 @@ class MissQueue(edge: TLEdgeOut, reqNum: Int)(implicit p: Parameters) extends DC
         }.elsewhen (can_allocate_vec(i)) {
           // compress & alloc
           analysis.strategy(i) := 4.U | 1.U
-          // Allocate using alloc_order to account for invalid earlier requests
-          val has_enough_free = alloc_order(i) < free_entry_count
+          // Allocate using the load-age-sorted order while preserving non-load slots.
+          val has_enough_free = sorted_alloc_order(i) < free_entry_count
 
           when (has_enough_free) {
-            analysis.target_mshr(i) := free_entry_list(alloc_order(i))
+            analysis.target_mshr(i) := free_entry_list(sorted_alloc_order(i))
           }.otherwise {
             // Not enough free entries, remove allocate bit
             analysis.strategy(i) := 4.U
@@ -1511,11 +1560,11 @@ class MissQueue(edge: TLEdgeOut, reqNum: Int)(implicit p: Parameters) extends DC
         analysis.strategy(i) := 1.U
         analysis.valid(i) := true.B
 
-        // Allocate using alloc_order to account for invalid earlier requests
-        val has_enough_free = alloc_order(i) < free_entry_count
+        // Allocate using the load-age-sorted order while preserving non-load slots.
+        val has_enough_free = sorted_alloc_order(i) < free_entry_count
 
         when (has_enough_free) {
-          analysis.target_mshr(i) := free_entry_list(alloc_order(i))
+          analysis.target_mshr(i) := free_entry_list(sorted_alloc_order(i))
           analysis.compress_group(i) := i.U
         }.otherwise {
           // Not enough free entries, mark as invalid
@@ -1561,6 +1610,24 @@ class MissQueue(edge: TLEdgeOut, reqNum: Int)(implicit p: Parameters) extends DC
   val query_fire = WireInit(VecInit(Seq.fill(reqNum)(false.B)))
   for (i <- 0 until reqNum) {
     query_fire(i) := io.queryMQ(i).req.valid && io.queryMQ(i).ready
+  }
+
+  for (i <- 0 until reqNum; j <- i + 1 until reqNum) {
+    val i_alloc_load = query_fire(i) && ((analysis.strategy(i) & 1.U) =/= 0.U) &&
+      analysis.compress_group(i) === i.U && io.queryMQ(i).req.bits.isFromLoad
+    val j_alloc_load = query_fire(j) && ((analysis.strategy(j) & 1.U) =/= 0.U) &&
+      analysis.compress_group(j) === j.U && io.queryMQ(j).req.bits.isFromLoad
+    val i_is_older = isBefore(io.queryMQ(i).req.bits.lqIdx, io.queryMQ(j).req.bits.lqIdx)
+    val j_is_older = isBefore(io.queryMQ(j).req.bits.lqIdx, io.queryMQ(i).req.bits.lqIdx)
+
+    when (i_alloc_load && j_alloc_load && i_is_older) {
+      assert(analysis.target_mshr(i) < analysis.target_mshr(j),
+        "An older load must be allocated a smaller MSHR ID")
+    }
+    when (i_alloc_load && j_alloc_load && j_is_older) {
+      assert(analysis.target_mshr(j) < analysis.target_mshr(i),
+        "An older load must be allocated a smaller MSHR ID")
+    }
   }
 
   /*  MissQueue enq logic is now splitted into 2 cycles
