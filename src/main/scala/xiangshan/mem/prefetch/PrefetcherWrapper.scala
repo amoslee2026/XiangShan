@@ -34,6 +34,7 @@ trait PrefetcherParams {
 trait HasPrefetcherParams extends HasXSParameter{
   def LD_TRAIN_WIDTH = backendParams.LdExuCnt
   def ST_TRAIN_WIDTH = backendParams.StaExuCnt
+  def DEGREE_WIDTH = 2
 
   // You can set the unified interface to N, and the invalid that you don't need can be set to 0
   val L1_PF_REG_CNT = 1
@@ -98,10 +99,10 @@ class PrefetcherWrapper(implicit p: Parameters) extends PrefetchModule {
     // prefetch req sender
     val l1_pf_to_l1 = DecoupledIO(new L1PrefetchReq())
     val l1_pf_to_l2 = Output(new xscache.coupledL2.PrefetchRecv())
+    val l1_pf_to_l3 = Output(new xscache.coupledL2.PrefetchRecv())
+    val l2_fdbk_pf_ctrl = Input(new xscache.coupledL2.L2ToL1PfCtrl)
+    // TODO: l2_pf degree control internally
   })
-
-  def isLoadAccess(uop: DynInst): Bool = FuType.isLoad(uop.fuType) || FuType.isVLoad(uop.fuType)
-  def isStoreAccess(uop: DynInst): Bool = FuType.isStore(uop.fuType)
 
   val hartId = p(XSCoreParamsKey).HartId
   val l1D_pf_enable = RegNextN(io.pfCtrlFromCSR.l1D_pf_enable, 2, Some(true.B))
@@ -157,10 +158,11 @@ class PrefetcherWrapper(implicit p: Parameters) extends PrefetchModule {
   val IdxStreamStride = prefetcherSeq.indexWhere(_.isInstanceOf[StreamStrideParams])
   val HasBerti = prefetcherSeq.exists(_.isInstanceOf[BertiParams])
   val IdxBerti = prefetcherSeq.indexWhere(_.isInstanceOf[BertiParams])
+  val modeStrideBertiDefault = coreParams.modeStrideBerti // default is strideOnBertiOff
 
   private val Seq(bothOff, strideOnBertiOff, strideOffBertiOn, bothOn) = Seq(0, 1, 2, 3)
   // strideOffBertiOn: if you enable Berti, Stride will be closed by default.
-  val modeStrideBerti = Constantin.createRecord(s"pf_modeStrideBerti$hartId", initValue = strideOffBertiOn)
+  val modeStrideBerti = Constantin.createRecord(s"pf_modeStrideBerti$hartId", initValue = modeStrideBertiDefault)
   val strideModeEnable = modeStrideBerti =/= bothOff.U && !(modeStrideBerti === strideOffBertiOn.U && HasBerti.B)
   val bertiModeEnable = modeStrideBerti =/= bothOff.U && !(modeStrideBerti === strideOnBertiOff.U && HasStreamStride.B)
 
@@ -168,8 +170,8 @@ class PrefetcherWrapper(implicit p: Parameters) extends PrefetchModule {
   smsOpt.foreach (pf => {
     val enableSMS = Constantin.createRecord(s"pf_enableSMS$hartId", initValue = true)
     // constantinCtrl && master switch csrCtrl && single switch csrCtrl
-    pf.io.enable := enableSMS && l1D_pf_enable &&
-      GatedRegNextN(io.pfCtrlFromCSR.l2_pf_recv_enable, 2, Some(false.B))
+    pf.io.enable := enableSMS && l1D_pf_enable
+    pf.io.fdbkDegree := io.l2_fdbk_pf_ctrl.smsDegree
     pf.io_agt_en := GatedRegNextN(io.pfCtrlFromCSR.l1D_pf_enable_agt, 2, Some(false.B))
     pf.io_pht_en := GatedRegNextN(io.pfCtrlFromCSR.l1D_pf_enable_pht, 2, Some(false.B))
     pf.io_act_threshold := GatedRegNextN(io.pfCtrlFromCSR.l1D_pf_active_threshold, 2, Some(12.U))
@@ -214,16 +216,22 @@ class PrefetcherWrapper(implicit p: Parameters) extends PrefetchModule {
     pf.io.l3_req.ready := false.B
   })
 
-  val strideOpt: Option[L1Prefetcher] = if(HasStreamStride) Some(Module(new L1Prefetcher())) else None
-  strideOpt.foreach(pf => {
+  val streamStrideOpt: Option[L1Prefetcher] = if(HasStreamStride) Some(Module(new L1Prefetcher())) else None
+  streamStrideOpt.foreach(pf => {
     val enableL1StreamPrefetcher = Constantin.createRecord(s"pf_enableL1StreamPrefetcher$hartId", initValue = true)
+    val enableL1StridePrefetcher = Constantin.createRecord(s"pf_enableL1StridePrefetcher$hartId", initValue = true)
     // constantinCtrl && master switch csrCtrl && single switch csrCtrl
-    pf.io.enable := enableL1StreamPrefetcher && l1D_pf_enable &&
-      GatedRegNextN(io.pfCtrlFromCSR.l1D_pf_enable_stride, 2, Some(false.B))
+    pf.io.enable := l1D_pf_enable
+    pf.io.fdbkDegree := 1.U
 
     pf.pf_ctrl <> io.pfCtrlFromDCache
     pf.l2PfqBusy := io.pfCtrlFromTile.l2PfqBusy
-    pf.strideEnable := strideModeEnable
+    pf.streamEnable := l1D_pf_enable && enableL1StreamPrefetcher &&
+      GatedRegNextN(io.pfCtrlFromCSR.l1D_pf_stream_enable, 2, Some(false.B))
+    pf.strideEnable := l1D_pf_enable && enableL1StridePrefetcher && strideModeEnable &&
+      GatedRegNextN(io.pfCtrlFromCSR.l1D_pf_stride_enable, 2, Some(false.B))
+    pf.streamFdbkDegree := io.l2_fdbk_pf_ctrl.streamDegree
+    pf.strideFdbkDegree := io.l2_fdbk_pf_ctrl.strideDegree
 
     // stride will train on miss or prefetch hit
     for(i <- 0 until LD_TRAIN_WIDTH){
@@ -262,8 +270,9 @@ class PrefetcherWrapper(implicit p: Parameters) extends PrefetchModule {
     val enableBerti = Constantin.createRecord(s"pf_enableBerti$hartId", initValue = true)
     // constantinCtrl && master switch csrCtrl && single switch csrCtrl
     pf.io.enable := enableBerti && l1D_pf_enable &&
-      GatedRegNextN(io.pfCtrlFromCSR.berti_enable, 2, Some(false.B)) &&
+      GatedRegNextN(io.pfCtrlFromCSR.l1D_pf_berti_enable, 2, Some(false.B)) &&
       bertiModeEnable
+    pf.io.fdbkDegree := io.l2_fdbk_pf_ctrl.bertiDegree
 
     for(i <- 0 until LD_TRAIN_WIDTH){
       val source = io.trainSource.s3_load(i)
@@ -321,7 +330,12 @@ class PrefetcherWrapper(implicit p: Parameters) extends PrefetchModule {
   io.l1_pf_to_l2.addr_valid := l2_pf_req.valid
   io.l1_pf_to_l2.addr := l2_pf_req.bits.addr
   io.l1_pf_to_l2.pf_source := l2_pf_req.bits.source
-  io.l1_pf_to_l2.l2_pf_en := RegNextN(io.pfCtrlFromCSR.l2_pf_enable, L2_PF_REG_CNT, Some(true.B))
+  io.l1_pf_to_l2.pf_en := RegNextN(io.pfCtrlFromCSR.l2_pf_enable, L2_PF_REG_CNT, Some(true.B))
+
+  io.l1_pf_to_l3.addr_valid := l3_pf_req.valid
+  io.l1_pf_to_l3.addr := l3_pf_req.bits.addr
+  io.l1_pf_to_l3.pf_source := l3_pf_req.bits.source
+  io.l1_pf_to_l3.pf_en := RegNextN(io.pfCtrlFromCSR.l2_pf_enable, L3_PF_REG_CNT, Some(true.B))
 
   val l2_trace = Wire(new LoadPfDbBundle)
   l2_trace.paddr := l2_pf_req.bits.addr

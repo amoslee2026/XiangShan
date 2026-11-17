@@ -38,7 +38,10 @@ trait ChiselModule extends SbtModule with ScalafmtModule {
 
   def scalacOptions = Seq("-language:reflectiveCalls", "-Ymacro-annotations", "-Ytasty-reader")
 
-  def ivyDeps: T[Agg[Dep]] = Agg(mvn"org.chipsalliance::chisel:7.13.0")
+  def ivyDeps: T[Agg[Dep]] = Agg(
+    mvn"org.chipsalliance::chisel:7.13.0",
+    mvn"com.lihaoyi::sourcecode:0.4.4",
+  )
 
   def scalacPluginIvyDeps: T[Agg[Dep]] = Agg(mvn"org.chipsalliance:::chisel-plugin:7.13.0")
 
@@ -78,25 +81,46 @@ object `rocket-chip` extends ChiselModule {
 object utility extends ChiselModule {
   def moduleDeps = Seq(`rocket-chip`)
 
-  def ivyDeps: T[Agg[Dep]] = super.ivyDeps() ++ Agg(mvn"com.lihaoyi::sourcecode:0.4.4")
+  def ivyDeps: T[Agg[Dep]] = super.ivyDeps()
 
   object test extends SbtTests with TestModule.ScalaTest {
     def ivyDeps: T[Agg[Dep]] = super.ivyDeps() ++ Agg(mvn"org.scalatest::scalatest:3.2.19")
   }
 }
 
-object yunsuan extends ChiselModule {}
+object yunsuan extends ChiselModule {
+  def ivyDeps: T[Agg[Dep]] = super.ivyDeps() ++ Agg(mvn"com.lihaoyi::sourcecode:0.4.4")
+}
 
 object XSCache extends ChiselModule {
   def millSourcePath = pwd / "XSCache"
 
-  def moduleDeps = Seq(`rocket-chip`, utility, openNCB)
+  def moduleDeps = Seq(`rocket-chip`, utility, openNCB, zhujiangCompat)
+
+  override def sources: T[Seq[PathRef]] = Task.Sources {
+    super.sources() ++ Seq(
+      PathRef(millSourcePath / "src" / "test" / "scala" / "ZhuJiangBridge.scala")
+    )
+  }
 }
 
 object openNCB extends ChiselModule {
   def millSourcePath = pwd / "XSCache" / "OpenNCB"
 
   def moduleDeps = Seq(`rocket-chip`)
+}
+
+object zhujiangCompat extends ChiselModule {
+  def millSourcePath = pwd / "XSCache" / "ZhuJiang"
+
+  def moduleDeps = Seq(`rocket-chip`, utility, difftest)
+
+  override def sources: T[Seq[PathRef]] = Task.Sources {
+    Seq(
+      PathRef(millSourcePath / "src" / "main" / "scala"),
+      PathRef(millSourcePath / "xs-utils" / "src" / "main" / "scala")
+    )
+  }
 }
 
 object difftest extends ChiselModule {
@@ -128,6 +152,7 @@ object xiangshan extends ChiselModule {
     `rocket-chip`,
     difftest,
     XSCache,
+    zhujiangCompat,
     yunsuan,
     utility,
     ChiselAIA,
@@ -151,7 +176,7 @@ object xiangshan extends ChiselModule {
     mvn"io.circe::circe-generic-extras:0.14.4"
   )
 
-  def scalacOptions: T[Seq[String]] = super.scalacOptions() ++ Agg("-deprecation", "-feature")
+  def scalacOptions: T[Seq[String]] = super.scalacOptions() ++ Agg("-deprecation", "-feature", "-Wunused")
 
   private def publishLocale: Locale = new Locale.Builder().setLanguage("en").build()
   private def publishVersion: T[String] = VcsVersion.vcsState().format(

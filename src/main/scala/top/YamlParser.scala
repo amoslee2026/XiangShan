@@ -37,9 +37,12 @@ case class YamlConfig(
   PmemRanges: Option[List[MemoryRange]],
   PMAConfigs: Option[List[PMAConfigEntry]],
   EnableCHIAsyncBridge: Option[Boolean],
+  LLC: Option[String],
   L2CacheConfig: Option[L2CacheConfig],
   OpenLLCConfig: Option[OpenLLCConfig],
+  ZhuJiangConfig: Option[ZhuJiangConfig],
   HartIDBits: Option[Int],
+  HartIDDmodeWidth: Option[Int],
   DebugAttachProtocals: Option[List[String]],
   DebugModuleParams: Option[DebugModuleParams],
   WFIResume: Option[Boolean],
@@ -60,7 +63,7 @@ case class YamlConfig(
   CHIAddrWidth: Option[Int],
   CVMParams: Option[CVMParameters],
   EnableBitmapCheck: Option[Boolean],
-  EnableBitmapCheckDefault: Option[Boolean],
+  EnableResetMtvec: Option[Boolean],
 )
 
 object YamlParser {
@@ -92,12 +95,16 @@ object YamlParser {
     yamlConfig.EnableCHIAsyncBridge.foreach { enable =>
       newConfig = newConfig.alter((site, here, up) => {
         case SoCParamsKey => up(SoCParamsKey).copy(
-          EnableCHIAsyncBridge = Option.when(enable)(AsyncQueueParams(depth = 16, sync = 3, safe = false))
+          EnableCHIAsyncBridge = Option.when(enable)(AsyncQueueParams(depth = 16, sync = 3, safe = true))
         )
       })
     }
     yamlConfig.L2CacheConfig.foreach(l2 => newConfig = newConfig.alter(l2))
     yamlConfig.OpenLLCConfig.foreach(llc => newConfig = newConfig.alter(llc))
+    yamlConfig.ZhuJiangConfig.foreach(zj => newConfig = newConfig.alter(zj))
+    yamlConfig.LLC.foreach { llc =>
+      newConfig = newConfig.alter(LLCConfig(llc))
+    }
     yamlConfig.DebugAttachProtocals.foreach { protocols =>
       newConfig = newConfig.alter((site, here, up) => {
         case ExportDebug => DebugAttachParams(protocols = protocols.map {
@@ -111,6 +118,16 @@ object YamlParser {
     yamlConfig.HartIDBits.foreach { bits =>
       newConfig = newConfig.alter((site, here, up) => {
         case MaxHartIdBits => bits
+      })
+    }
+    yamlConfig.HartIDDmodeWidth.foreach { width =>
+      newConfig = newConfig.alter((site, here, up) => {
+        case XSTileKey => up(XSTileKey).map(_.copy(hartIDDmodeWidth = width))
+      })
+    }
+    yamlConfig.EnableResetMtvec.foreach { enable =>
+      newConfig = newConfig.alter((site, here, up) => {
+        case XSTileKey => up(XSTileKey).map(_.copy(enableResetMtvec = enable))
       })
     }
     yamlConfig.DebugModuleParams.foreach { params =>
@@ -206,11 +223,6 @@ object YamlParser {
     yamlConfig.EnableBitmapCheck.foreach { enable =>
       newConfig = newConfig.alter((site, here, up) => {
         case XSTileKey => up(XSTileKey).map(_.copy(HasBitmapCheck = enable))
-      })
-    }
-    yamlConfig.EnableBitmapCheckDefault.foreach { enable =>
-      newConfig = newConfig.alter((site, here, up) => {
-        case XSTileKey => up(XSTileKey).map(_.copy(HasBitmapCheckDefault = enable))
       })
     }
     newConfig

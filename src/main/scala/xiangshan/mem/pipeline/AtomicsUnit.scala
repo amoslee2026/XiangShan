@@ -43,7 +43,7 @@ class AtomicsUnit(val param: ExeUnitParams)(implicit p: Parameters) extends XSMo
 
   val io = IO(new Bundle() {
     val hartId        = Input(UInt(hartIdLen.W))
-    val in            = Flipped(Decoupled(new ExuInput(param, hasCopySrc = true)))
+    val in            = Flipped(Decoupled(new ExuInput(param)))
     val storeDataIn   = Flipped(Vec(StdCnt, Valid(new ExuInput(moudParam))))
     // AtomicsUnit re-uses lda port to write back
     val out           = new MemWriteBack(ldaParams.head)
@@ -61,17 +61,17 @@ class AtomicsUnit(val param: ExeUnitParams)(implicit p: Parameters) extends XSMo
   // Atomics Memory Accsess FSM
   //-------------------------------------------------------
   val List(
-    s_invalid, 
-    s_tlb_and_flush_sbuffer_req, 
-    s_pm, 
-    s_wait_flush_sbuffer_resp, 
-    s_cache_req, 
+    s_invalid,
+    s_tlb_and_flush_sbuffer_req,
+    s_pm,
+    s_wait_flush_sbuffer_resp,
+    s_cache_req,
     s_cache_resp,
-    s_cache_resp_latch, 
-    s_finish, 
-    s_finish2, 
-    s_extra_wb2, 
-    s_extra_wb, 
+    s_cache_resp_latch,
+    s_finish,
+    s_finish2,
+    s_extra_wb2,
+    s_extra_wb,
   ) = Enum(11)
   val state = RegInit(s_invalid)
   val out_valid = RegInit(false.B)
@@ -137,6 +137,8 @@ class AtomicsUnit(val param: ExeUnitParams)(implicit p: Parameters) extends XSMo
 
   io.dtlb.req.valid    := false.B
   io.dtlb.req.bits     := DontCare
+  // TODO: Should be fixed later; see https://github.com/OpenXiangShan/XiangShan/pull/5610
+  io.dtlb.req.bits.frm_mabuf := false.B
   io.dtlb.req_kill     := false.B
   io.dtlb.resp.ready   := true.B
 
@@ -192,13 +194,13 @@ class AtomicsUnit(val param: ExeUnitParams)(implicit p: Parameters) extends XSMo
   val csrCtrl = io.csrCtrl
   val tdata = Reg(Vec(TriggerNum, new MatchTriggerIO))
   val tEnableVec = RegInit(VecInit(Seq.fill(TriggerNum)(false.B)))
-  tEnableVec := csrCtrl.mem_trigger.tEnableVec
-  when (csrCtrl.mem_trigger.tUpdate.valid) {
-    tdata(csrCtrl.mem_trigger.tUpdate.bits.addr) := csrCtrl.mem_trigger.tUpdate.bits.tdata
+  tEnableVec := csrCtrl.memTrigger.tEnableVec
+  when (csrCtrl.memTrigger.tUpdate.valid) {
+    tdata(csrCtrl.memTrigger.tUpdate.bits.addr) := csrCtrl.memTrigger.tUpdate.bits.tdata
   }
 
-  val debugMode = csrCtrl.mem_trigger.debugMode
-  val triggerCanRaiseBpExp = csrCtrl.mem_trigger.triggerCanRaiseBpExp
+  val debugMode = csrCtrl.memTrigger.debugMode
+  val triggerCanRaiseBpExp = csrCtrl.memTrigger.triggerCanRaiseBpExp
   val backendTriggerTimingVec = VecInit(tdata.map(_.timing))
   val backendTriggerChainVec = VecInit(tdata.map(_.chain))
   val backendTriggerHitVec = WireInit(VecInit(Seq.fill(TriggerNum)(false.B)))
@@ -316,6 +318,9 @@ class AtomicsUnit(val param: ExeUnitParams)(implicit p: Parameters) extends XSMo
       (pmp.ld || exception_pa_mmio_nc) && isLr
     exceptionVec(storeAccessFault) := exceptionVec(storeAccessFault) || pmp.st ||
       (pmp.ld || exception_pa_mmio_nc) && !isLr
+    // if used atomic access mmio region, should report *accessFault first.
+    exceptionVec(loadAddrMisaligned)  := exceptionVec(loadAddrMisaligned) && !exception_pa_mmio_nc
+    exceptionVec(storeAddrMisaligned) := exceptionVec(storeAddrMisaligned) && !exception_pa_mmio_nc
   }
 
   when (state === s_wait_flush_sbuffer_resp) {
@@ -402,11 +407,11 @@ class AtomicsUnit(val param: ExeUnitParams)(implicit p: Parameters) extends XSMo
       ))
     )
 
-    when (dcache_resp_tl_error.asUInt.orR && io.csrCtrl.cache_error_enable) {
-      exceptionVec(loadAccessFault)  := isLr && dcache_resp_tl_error.tl_denied
-      exceptionVec(storeAccessFault) := !isLr && dcache_resp_tl_error.tl_denied
-      exceptionVec(hardwareError)    := dcache_resp_tl_error.tl_corrupt && !dcache_resp_tl_error.tl_denied
-    }
+    val canTriggerCacheError = dcache_resp_tl_error.asUInt.orR && io.csrCtrl.cacheErrorEnable
+
+    exceptionVec(loadAccessFault)  := canTriggerCacheError && isLr && dcache_resp_tl_error.tl_denied
+    exceptionVec(storeAccessFault) := canTriggerCacheError && !isLr && dcache_resp_tl_error.tl_denied
+    exceptionVec(hardwareError)    := canTriggerCacheError && dcache_resp_tl_error.tl_corrupt && !dcache_resp_tl_error.tl_denied
 
     resp_data := resp_data_wire
     state := s_finish
@@ -459,6 +464,7 @@ class AtomicsUnit(val param: ExeUnitParams)(implicit p: Parameters) extends XSMo
     stdCnt := 0.U
     pdest1Valid := false.B
     pdest2Valid := false.B
+    exceptionVec := ExceptSparseVec.zeros(param.exceptionOut)
   }
 
   /**
@@ -548,58 +554,32 @@ class AtomicsUnit(val param: ExeUnitParams)(implicit p: Parameters) extends XSMo
   ) && state === s_cache_req
   val pipe_req = io.dcache.req.bits
   pipe_req := DontCare
-  pipe_req.cmd := LookupTree(uop.fuOpType, List(
-    // TODO: optimize this
-    LSUOpType.amoswap_b -> M_XA_SWAP,
-    LSUOpType.amoadd_b  -> M_XA_ADD,
-    LSUOpType.amoxor_b  -> M_XA_XOR,
-    LSUOpType.amoand_b  -> M_XA_AND,
-    LSUOpType.amoor_b   -> M_XA_OR,
-    LSUOpType.amomin_b  -> M_XA_MIN,
-    LSUOpType.amomax_b  -> M_XA_MAX,
-    LSUOpType.amominu_b -> M_XA_MINU,
-    LSUOpType.amomaxu_b -> M_XA_MAXU,
-    LSUOpType.amocas_b  -> M_XA_CASB,
-
-    LSUOpType.amoswap_h -> M_XA_SWAP,
-    LSUOpType.amoadd_h  -> M_XA_ADD,
-    LSUOpType.amoxor_h  -> M_XA_XOR,
-    LSUOpType.amoand_h  -> M_XA_AND,
-    LSUOpType.amoor_h   -> M_XA_OR,
-    LSUOpType.amomin_h  -> M_XA_MIN,
-    LSUOpType.amomax_h  -> M_XA_MAX,
-    LSUOpType.amominu_h -> M_XA_MINU,
-    LSUOpType.amomaxu_h -> M_XA_MAXU,
-    LSUOpType.amocas_h  -> M_XA_CASH,
-
-    LSUOpType.lr_w      -> M_XLR,
-    LSUOpType.sc_w      -> M_XSC,
-    LSUOpType.amoswap_w -> M_XA_SWAP,
-    LSUOpType.amoadd_w  -> M_XA_ADD,
-    LSUOpType.amoxor_w  -> M_XA_XOR,
-    LSUOpType.amoand_w  -> M_XA_AND,
-    LSUOpType.amoor_w   -> M_XA_OR,
-    LSUOpType.amomin_w  -> M_XA_MIN,
-    LSUOpType.amomax_w  -> M_XA_MAX,
-    LSUOpType.amominu_w -> M_XA_MINU,
-    LSUOpType.amomaxu_w -> M_XA_MAXU,
-    LSUOpType.amocas_w  -> M_XA_CASW,
-
-    LSUOpType.lr_d      -> M_XLR,
-    LSUOpType.sc_d      -> M_XSC,
-    LSUOpType.amoswap_d -> M_XA_SWAP,
-    LSUOpType.amoadd_d  -> M_XA_ADD,
-    LSUOpType.amoxor_d  -> M_XA_XOR,
-    LSUOpType.amoand_d  -> M_XA_AND,
-    LSUOpType.amoor_d   -> M_XA_OR,
-    LSUOpType.amomin_d  -> M_XA_MIN,
-    LSUOpType.amomax_d  -> M_XA_MAX,
-    LSUOpType.amominu_d -> M_XA_MINU,
-    LSUOpType.amomaxu_d -> M_XA_MAXU,
-    LSUOpType.amocas_d  -> M_XA_CASD,
-
-    LSUOpType.amocas_q  -> M_XA_CASQ
+  val amoOpcode = LSUOpType.getAmoOp(uop.fuOpType)
+  val size = LSUOpType.size(uop.fuOpType)
+  pipe_req.cmd := LookupTree(amoOpcode, List(
+    LSUOpType.AmoOp.lr   -> M_XLR,
+    LSUOpType.AmoOp.sc   -> M_XSC,
+    LSUOpType.AmoOp.swap -> M_XA_SWAP,
+    LSUOpType.AmoOp.add  -> M_XA_ADD,
+    LSUOpType.AmoOp.xor  -> M_XA_XOR,
+    LSUOpType.AmoOp.and  -> M_XA_AND,
+    LSUOpType.AmoOp.or   -> M_XA_OR,
+    LSUOpType.AmoOp.min  -> M_XA_MIN,
+    LSUOpType.AmoOp.max  -> M_XA_MAX,
+    LSUOpType.AmoOp.minu -> M_XA_MINU,
+    LSUOpType.AmoOp.maxu -> M_XA_MAXU,
+    LSUOpType.AmoOp.cas  -> LookupTree(
+      size,
+      List(
+        LSUOpType.B.U -> M_XA_CASB,
+        LSUOpType.H.U -> M_XA_CASH,
+        LSUOpType.W.U -> M_XA_CASW,
+        LSUOpType.D.U -> M_XA_CASD,
+        LSUOpType.Q.U -> M_XA_CASQ,
+      )
+    )
   ))
+
   pipe_req.miss := false.B
   pipe_req.probe := false.B
   pipe_req.probe_need_data := false.B
@@ -615,13 +595,15 @@ class AtomicsUnit(val param: ExeUnitParams)(implicit p: Parameters) extends XSMo
   if (env.EnableDifftest) {
     val difftest = DifftestModule(new DiffAtomicEvent)
     val en = io.dcache.req.fire
+    val difftestFuOp = LSUOpType.formDifftestOpcode(uop.fuOpType)
+
     difftest.coreid := io.hartId
     difftest.valid  := state === s_cache_resp_latch
     difftest.addr   := RegEnable(paddr, en)
     difftest.data   := RegEnable(io.dcache.req.bits.amo_data.asTypeOf(difftest.data), en)
     difftest.mask   := RegEnable(io.dcache.req.bits.amo_mask, en)
     difftest.cmp    := RegEnable(io.dcache.req.bits.amo_cmp.asTypeOf(difftest.cmp), en)
-    difftest.fuop   := RegEnable(uop.fuOpType, en)
+    difftest.fuop   := RegEnable(difftestFuOp, en)
     difftest.out    := resp_data_wire.asTypeOf(difftest.out)
   }
 

@@ -40,7 +40,7 @@ class MemExceptionInfo(implicit p: Parameters) extends XSBundle {
   val isHyper           = Bool()
   val vstart            = UInt((log2Up(VLEN) + 1).W)
   val vl                = UInt((log2Up(VLEN) + 1).W)
-  val gpaddr            = UInt(GPAddrBits.W)
+  val gpaddr            = UInt(XLEN.W)
   val isForVSnonLeafPTE = Bool()
 }
 
@@ -48,13 +48,13 @@ class ExceptionOut(implicit p: Parameters) extends XSBundle {
   val vaddr             = Output(UInt(XLEN.W))
   val vstart            = Output(UInt((log2Up(VLEN) + 1).W))
   val vl                = Output(UInt((log2Up(VLEN) + 1).W))
-  val gpaddr            = Output(UInt(GPAddrBits.W))
+  val gpaddr            = Output(UInt(XLEN.W))
   val isForVSnonLeafPTE = Output(Bool())
 }
 
 class ExceptionInfoGen(implicit p: Parameters) extends XSModule with HasCircularQueuePtrHelper{
-  // loadUnit, storeUnit, VLoad, VStore, storeQueue Uncache, LoadQueue Uncache, VSegmentUnit, Atomic
-  private val enqPortNum = StorePipelineWidth + LoadPipelineWidth + VecLoadPipelineWidth + VecStorePipelineWidth + 1 + 1 + 1 + 1
+  // loadUnit, storeUnit, storeQueue Uncache, LoadQueue Uncache, Atomic
+  private val enqPortNum = StorePipelineWidth + LoadPipelineWidth + 1 + 1 + 1
   val io = IO(new Bundle{
     val redirect      = Flipped(ValidIO(new Redirect))
     val fromCsr       = Input(new TlbCsrBundle)
@@ -62,7 +62,7 @@ class ExceptionInfoGen(implicit p: Parameters) extends XSModule with HasCircular
     val exceptionInfo = new ExceptionOut // don't have valid
   })
   private def isOlder(left: MemExceptionInfo, right: MemExceptionInfo): Bool = {
-    isBefore(left.robIdx, right.robIdx) || (left.robIdx === right.robIdx && left.uopIdx < right.uopIdx)
+    left.robIdx.isBeforeSlot(right.robIdx) || (left.robIdx.isSameSlot(right.robIdx) && left.uopIdx < right.uopIdx)
   }
 
   private def GenExceptionVa(
@@ -182,7 +182,7 @@ class ExceptionInfoGen(implicit p: Parameters) extends XSModule with HasCircular
 
   when(currentValid) {
     when(outValid) {
-      when(currentExcp.robIdx > oldestBits.robIdx || oldestBits.robIdx === currentExcp.robIdx && currentExcp.uopIdx > oldestBits.uopIdx) {
+      when(currentExcp.robIdx.isAfterSlot(oldestBits.robIdx) || oldestBits.robIdx.isSameSlot(currentExcp.robIdx) && currentExcp.uopIdx > oldestBits.uopIdx) {
         currentExcp := oldestBits
       }
     }

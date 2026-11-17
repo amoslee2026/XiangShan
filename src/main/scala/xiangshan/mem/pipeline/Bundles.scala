@@ -87,6 +87,7 @@ class LoadPipeBundle(
   val align = Option.when(param.hasUnalignHandling)(Bool())
   val unalignHead = Option.when(param.hasUnalignHandling)(Bool())
   val readWholeBank = Option.when(param.hasUnalignHandling)(Bool()) // TODO: remove this
+  val lrqAmbReplay = Option.when(param.hasUnalignHandling)(Bool())
 
   // MMU & exception handling
   val tlbAccessResult = Option.when(param.hasAddrTrans)(TlbAccessResult())
@@ -103,6 +104,7 @@ class LoadPipeBundle(
   val mshrId = Option.when(param.replayFromToLRQ)(UInt(log2Up(cfg.nMissEntries).W)) // valid when `handledByMSHR` is HIGH
   val replayQueueIdx = Option.when(param.replayFromToLRQ)(UInt(log2Up(LoadQueueReplaySize+1).W)) // valid when `entrance` is replay
   val cause = Option.when(param.replayFromToLRQ)(Vec(LoadReplayCauses.allCauses, Bool()))
+  val specialModeRequest = Bool()
   val fastReplayNukeFirst = Option.when(param.hasS2PreProcess)(Bool())// When stld_nuke and storeset hit occur simultaneously, stld_nuke should be handled first.
 
   val handledByMSHR = Option.when(param.replayToLRQ)(Bool())
@@ -137,12 +139,15 @@ class LoadPipeBundle(
   // S1 -> S2
   val shouldFastReplay = Option.when(param.hasS2PreProcess)(Bool())
   // S2 -> S3
+  val causeOrR = Option.when(param.hasS3PreProcess)(Bool())
   val troubleMaker = Option.when(param.hasS3PreProcess)(Bool())
   val rrBankConflictFastReplay = Option.when(param.hasS3PreProcess)(Bool())
   val rrBankConflictFastReplayGrant = Option.when(param.hasS3PreProcess)(Bool())
   val matchInvalid = Option.when(param.hasS3PreProcess)(Bool())
   val shouldWakeup = Option.when(param.hasS3PreProcess)(Bool())
   val shouldWriteback = Option.when(param.hasS3PreProcess)(Bool())
+  val sqSbufferForwarded = Option.when(param.hasS3PreProcess)(Bool())
+  val sqSbufferFullForwarded = Option.when(param.hasS3PreProcess)(Bool())
   // S3 -> S4
   val hasException = Option.when(param.hasS4PreProcess)(Bool())
   val headAlwaysWriteback = Option.when(param.hasS4PreProcess)(Bool())
@@ -172,6 +177,8 @@ class LoadPipeBundle(
     forwardDChannel.get := false.B
     uncacheReplay.get := false.B
     ncReplay.get := false.B
+    lrqAmbReplay.foreach(_ := false.B)
+    specialModeRequest := false.B
   }
   def DontCareVectorFields(): Unit = {
     elemIdx.get := 0.U
@@ -233,6 +240,11 @@ class VectorLoadIn(implicit p: Parameters)
 class LoadStageIO(implicit p: Parameters, implicit val s: LoadStage)
   extends LoadPipeBundle(LoadStageIOParam())
 
+class StdDataWriteWindow(numStdPorts: Int)(implicit p: Parameters) extends XSBundle {
+  val current = Vec(numStdPorts, Valid(new SqPtr))
+  val previous = Vec(numStdPorts, Valid(new SqPtr))
+}
+
 sealed trait HasStorePipeBundleParam {
   def hasVector: Boolean = false
   def hasStoreSet: Boolean = false
@@ -259,6 +271,7 @@ class StorePipeBundle(
   val size = UInt(MemorySize.Size.width.W)
   val mask = UInt((VLEN/8).W)
   val isFirstIssue = Bool()
+  val illegalIssue = Bool()
 
   // StoreSet
   val ssid = Option.when(param.hasStoreSet)(UInt(SSIDWidth.W))
@@ -268,6 +281,7 @@ class StorePipeBundle(
   val align = Option.when(param.hasUnalignHandling)(Bool())
   val unalignHead = Option.when(param.hasUnalignHandling)(Bool())
   val cross4KPage = Option.when(param.hasUnalignHandling)(Bool())
+  val isAddrReadyHead = Option.when(param.hasUnalignHandling)(Bool())
 
   // MMU & exception handling
   val tlbHit = Option.when(param.hasAddrTrans)(Bool())
@@ -283,27 +297,13 @@ class StorePipeBundle(
   val mmio = Option.when(param.hasPAddrChecked)(Bool())
   val memBackTypeMM = Option.when(param.hasPAddrChecked)(Bool())
 
-  // Vector
-  val vecBaseVaddr = Option.when(param.hasVector)(UInt(VAddrBits.W))
-  val usSecondInv = Option.when(param.hasVector)(Bool())
-  val elemIdx = Option.when(param.hasVector)(UInt(elemIdxBits.W))
-  val mbIndex = Option.when(param.hasVector)(UInt(vlmBindexBits.W))
-  val vecTriggerMask = Option.when(param.hasVector)(UInt((VLEN/8).W))
-  val vecVaddrOffset = Option.when(param.hasVector)(UInt(VAddrBits.W))
-
   def DontCareUnalign(): Unit = {
     align.get := DontCare
     unalignHead.get := DontCare
     cross4KPage.get := DontCare
+    isAddrReadyHead.get := DontCare
   }
-  def DontCareVectorFields(): Unit = {
-    vecBaseVaddr.get := 0.U
-    usSecondInv.get := false.B
-    elemIdx.get := 0.U
-    mbIndex.get := 0.U
-    vecTriggerMask.get := 0.U
-    vecVaddrOffset.get := 0.U
-  }
+
   def DontCareStoreSet(): Unit = {
     ssid.get := 0.U
     storeSetHit.get := false.B

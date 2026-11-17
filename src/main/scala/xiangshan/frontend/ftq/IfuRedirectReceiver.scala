@@ -21,6 +21,7 @@ import xiangshan.Redirect
 import xiangshan.RedirectLevel
 import xiangshan.Resolve
 import xiangshan.frontend.FrontendRedirect
+import xiangshan.frontend.GuardedPcInit
 
 trait IfuRedirectReceiver extends HasFtqParameters {
   def receiveIfuRedirect(
@@ -31,22 +32,25 @@ trait IfuRedirectReceiver extends HasFtqParameters {
     val redirect = WireInit(0.U.asTypeOf(Valid(new Redirect)))
     val resolve  = WireInit(0.U.asTypeOf(Valid(new Resolve)))
 
+    val pc             = GuardedPcInit(wbRedirect.bits.pc)
+    val selectedTarget = GuardedPcInit(Mux(wbRedirect.bits.attribute.isReturn, specTopAddr, wbRedirect.bits.target))
+
     redirect.valid          := wbRedirect.valid && !backendRedirect
     redirect.bits.ftqIdx    := wbRedirect.bits.ftqIdx
     redirect.bits.ftqOffset := wbRedirect.bits.ftqOffset
     redirect.bits.level     := RedirectLevel.flushAfter
     redirect.bits.isRVC     := wbRedirect.bits.isRVC
     redirect.bits.attribute := wbRedirect.bits.attribute
-    redirect.bits.pc        := wbRedirect.bits.pc
-    redirect.bits.target    := Mux(wbRedirect.bits.attribute.isReturn, specTopAddr, wbRedirect.bits.target)
+    redirect.bits.pc        := pc.toUInt
+    redirect.bits.target    := selectedTarget.toUInt
     redirect.bits.taken     := wbRedirect.bits.taken
     redirect.bits.isMisPred := true.B
 
     resolve.valid           := wbRedirect.valid && !backendRedirect && wbRedirect.bits.canTrain
     resolve.bits.ftqIdx     := wbRedirect.bits.ftqIdx
     resolve.bits.ftqOffset  := wbRedirect.bits.ftqOffset
-    resolve.bits.pc         := wbRedirect.bits.pc
-    resolve.bits.target     := Mux(wbRedirect.bits.attribute.isReturn, specTopAddr, wbRedirect.bits.target)
+    resolve.bits.pc         := pc.unGuard
+    resolve.bits.target     := selectedTarget.unGuard
     resolve.bits.taken      := wbRedirect.bits.taken
     resolve.bits.mispredict := true.B
     resolve.bits.attribute  := wbRedirect.bits.attribute

@@ -41,8 +41,7 @@ case class TageParameters(
     NumUsefulCtrSramFolds: Int = 8,
     WriteBufferSize:       Int = 4,
     UsefulResetCtrWidth:   Int = 8,
-    UseAltOnNaWidth:       Int = 7,
-    NumUseAltOnNa:         Int = 128,
+    UseAltOnNaWidth:       Int = 5,
     EnableTageTrace:       Boolean = false
 ) {}
 
@@ -59,21 +58,26 @@ trait HasTageParameters extends HasBpuParameters {
 
   def UsefulResetCtrWidth: Int = tageParameters.UsefulResetCtrWidth
   def UseAltOnNaWidth:     Int = tageParameters.UseAltOnNaWidth
-  def NumUseAltOnNa:       Int = tageParameters.NumUseAltOnNa
+  def NumUseAltOnNa:       Int = 2 * NumTables // each table corresponds to two counters
+  def UseAltOnNaIdxWidth:  Int = log2Ceil(NumUseAltOnNa)
 
   def TableInfos: Seq[TageTableInfo] = tageParameters.TableInfos
 
   def NumTables:     Int = TableInfos.length
   def TableIdxWidth: Int = log2Ceil(NumTables)
 
-  def MaxNumSets:     Int = TableInfos.map(_.getNumSets(NumBanks)).max
+  def MaxNumSets:     Int = TableInfos.map(NumSets(_)).max
   def MaxSetIdxWidth: Int = log2Ceil(MaxNumSets)
 
   def MaxNumWays:     Int = TableInfos.map(_.NumWays).max
   def MaxWayIdxWidth: Int = log2Ceil(MaxNumWays)
 
   // per table parameters
-  def NumSets(implicit info:     TageTableInfo): Int = info.getNumSets(NumBanks)
+  def NumSets(implicit info: TageTableInfo): Int = {
+    require(NumBanks > 0, "NumBanks must be > 0")
+    info.Size / info.NumWays / NumBanks
+  }
+
   def SetIdxWidth(implicit info: TageTableInfo): Int = log2Ceil(NumSets)
   def NumWays(implicit info:     TageTableInfo): Int = info.NumWays
   def WayIdxWidth(implicit info: TageTableInfo): Int = log2Ceil(NumWays)

@@ -20,7 +20,6 @@ package xiangshan.cache.mmu
 
 import org.chipsalliance.cde.config.Parameters
 import chisel3._
-import chisel3.experimental.ExtModule
 import chisel3.util._
 import xiangshan._
 import xiangshan.cache.{HasDCacheParameters, MemoryOpConstants}
@@ -92,21 +91,28 @@ class L2TLBImp(outer: L2TLB)(implicit p: Parameters) extends PtwModule(outer) wi
   val hPBMTE = csr_dup(0).hPBMTE
   val mmpt = csr_dup(0).mmpt
 
-  val flush  = sfence_dup(0).valid || satp.changed || vsatp.changed || hgatp.changed || priv.virt_changed || (if (HasMptCheck) (csr_dup(0).mmpt.changed) else false.B)
+  val flush  = sfence_dup(0).valid || satp.changed || vsatp.changed || hgatp.changed || priv.virtChanged || (if (HasMptCheck) (csr_dup(0).mmpt.changed) else false.B)
 
   val mptEn = Option.when(HasMptCheck) (mmpt.mode =/= 0.U)
 
   val pmp = Module(new PMP())
   val pmp_check = VecInit(Seq.fill(if (HasBitmapCheck || HasMptCheck) 5 else 4) (Module(new PMPChecker(lgMaxSize = 3, sameCycle = true)).io))
-  pmp.io.distribute_csr := io.csr.distribute_csr
+  pmp.io.distributeCsr := io.csr.distributeCsr
+  def pmpCheckMode(index: Int): UInt = if (HasMptCheck && index == 4) ModeM else ModeS
   if (HasBitmapCheck) {
     if (KeyIDBits > 0) {
-      pmp_check.foreach(_.check_env.apply(csr_dup(0).mbmc.KEYIDEN.asBool, csr_dup(0).mbmc.CMODE.asBool, ModeS, csr_dup(0).priv.debug, pmp.io.pmp, pmp.io.pma))
+      pmp_check.zipWithIndex.foreach { case (checker, index) =>
+        checker.check_env.apply(csr_dup(0).mbmc.KEYIDEN.asBool, csr_dup(0).mbmc.CMODE.asBool, pmpCheckMode(index), csr_dup(0).priv.debug, pmp.io.pmp, pmp.io.pma)
+      }
     } else {
-      pmp_check.foreach(_.check_env.apply(csr_dup(0).mbmc.CMODE.asBool, ModeS, csr_dup(0).priv.debug, pmp.io.pmp, pmp.io.pma))
+      pmp_check.zipWithIndex.foreach { case (checker, index) =>
+        checker.check_env.apply(csr_dup(0).mbmc.CMODE.asBool, pmpCheckMode(index), csr_dup(0).priv.debug, pmp.io.pmp, pmp.io.pma)
+      }
     }
   } else {
-    pmp_check.foreach(_.check_env.apply(ModeS, csr_dup(0).priv.debug, pmp.io.pmp, pmp.io.pma))
+    pmp_check.zipWithIndex.foreach { case (checker, index) =>
+      checker.check_env.apply(pmpCheckMode(index), csr_dup(0).priv.debug, pmp.io.pmp, pmp.io.pma)
+    }
   }
 
   // add bitmapcheck
@@ -216,6 +222,11 @@ class L2TLBImp(outer: L2TLB)(implicit p: Parameters) extends PtwModule(outer) wi
   val tlbCounter = RegInit(0.U(log2Ceil(MissQueueSize + 1).W))
   val reqVec = WireInit(VecInit(Seq.fill(PtwWidth)(false.B)))
   val respVec = WireInit(VecInit(Seq.fill(PtwWidth)(false.B)))
+  val arb1MptOnly = if (HasMptCheck) {
+    arb1.io.out.bits.mptOnly.get && mptEn.get
+  } else {
+    false.B
+  }
 
   for (i <- 0 until PtwWidth) {
     when (io.tlb(i).req(0).fire) {
@@ -237,7 +248,7 @@ class L2TLBImp(outer: L2TLB)(implicit p: Parameters) extends PtwModule(outer) wi
     mpt_arb.get.io.in(mptOnlyPort).bits.id := arb1.io.chosen // b101 + bx //tlb id to mptc id
     mpt_arb.get.io.in(mptOnlyPort).bits.mptOnly := true.B // used for l2tlb return control logic
     mpt_arb.get.io.in(mptOnlyPort).bits.reqPA := arb1.io.out.bits.vpn // for mpt only vpn is ppn
-    mpt_arb.get.io.in(mptOnlyPort).valid := arb1.io.out.fire && (arb1.io.out.bits.mptOnly.get) // valid when mptOnly and
+    mpt_arb.get.io.in(mptOnlyPort).valid := arb1.io.out.fire && arb1MptOnly // valid when mptOnly and
     // s2xlate is dont care, it has nothing to do with mpt
   }
 
@@ -249,7 +260,7 @@ class L2TLBImp(outer: L2TLB)(implicit p: Parameters) extends PtwModule(outer) wi
   ptw.io.llptw.ready := arb2.io.in(InArbPTWPort).ready
   block_decoupled(missQueue.io.out, arb2.io.in(InArbMissQueuePort), Mux(missQueue.io.out.bits.isLLptw, !llptw.io.in.ready, !ptw.io.req.ready))
 
-  arb2.io.in(InArbTlbPort).valid := arb1.io.out.fire && (if (HasMptCheck) !(arb1.io.out.bits.mptOnly.get) else true.B)
+  arb2.io.in(InArbTlbPort).valid := arb1.io.out.fire && !arb1MptOnly
   // not mpt only req will go to l2tlb,mptOnly goes to mptc directly
   arb2.io.in(InArbTlbPort).bits.req_info.vpn := arb1.io.out.bits.vpn
   arb2.io.in(InArbTlbPort).bits.req_info.s2xlate := arb1.io.out.bits.s2xlate
@@ -260,9 +271,12 @@ class L2TLBImp(outer: L2TLB)(implicit p: Parameters) extends PtwModule(outer) wi
   // 1. arb1 and arb2 are both comb logic, so ready can work just the same cycle
   // 2. arb1 can send one req at most in a cycle, so do not need to write
   //    "tlbCounter <= (MissQueueSize - 2).U"
-  arb1.io.out.ready := arb2.io.in(InArbTlbPort).ready && tlbCounter < MissQueueSize.U &&
-    (if (HasMptCheck) (mpt_arb.get.io.in(mptOnlyPort).ready) else true.B)
-  //arb1 out is ready when arb2 and mptc are both ready
+  val arb1TargetReady = if (HasMptCheck) {
+    Mux(arb1MptOnly, mpt_arb.get.io.in(mptOnlyPort).ready, arb2.io.in(InArbTlbPort).ready)
+  } else {
+    arb2.io.in(InArbTlbPort).ready
+  }
+  arb1.io.out.ready := tlbCounter < MissQueueSize.U && arb1TargetReady
   arb2.io.in(InArbHPTWPort).valid := hptw_req_arb.io.out.valid
   arb2.io.in(InArbHPTWPort).bits.req_info.vpn := hptw_req_arb.io.out.bits.gvpn
   arb2.io.in(InArbHPTWPort).bits.req_info.s2xlate := onlyStage2
@@ -1020,15 +1034,20 @@ class L2TLBImp(outer: L2TLB)(implicit p: Parameters) extends PtwModule(outer) wi
   for (i <- 0 until PtwWidth) {
     XSPerfAccumulate(s"req_count${i}", io.tlb(i).req(0).fire)
     XSPerfAccumulate(s"req_blocked_count_${i}", io.tlb(i).req(0).valid && !io.tlb(i).req(0).ready)
+    XSPerfAccumulate(s"resp_count${i}", io.tlb(i).resp.fire)
+    XSPerfAccumulate(s"cache_resp_count${i}", mergeArb(i).in(outArbCachePort).fire)
+    XSPerfAccumulate(s"ptw_resp_count${i}", mergeArb(i).in(outArbFsmPort).fire)
+    XSPerfAccumulate(s"llptw_resp_count${i}", mergeArb(i).in(outArbMqPort).fire)
+    XSPerfAccumulate(s"resp_fault_count${i}", io.tlb(i).resp.fire && (io.tlb(i).resp.bits.s1.pf || io.tlb(i).resp.bits.s1.af || io.tlb(i).resp.bits.s2.gpf || io.tlb(i).resp.bits.s2.gaf))
   }
   XSPerfAccumulate(s"req_blocked_by_mq", arb1.io.out.valid && missQueue.io.out.valid)
-  for (i <- 0 until (MemReqWidth + 1)) {
-    XSPerfAccumulate(s"mem_req_util${i}", PopCount(waiting_resp) === i.U)
-  }
+  XSPerfAccumulate("req_outstanding_cycle", tlbCounter)
+  XSPerfAccumulate("req_full_cycle", tlbCounter === MissQueueSize.U)
   XSPerfAccumulate("mem_cycle", PopCount(waiting_resp) =/= 0.U)
+  XSPerfAccumulate("mem_outstanding_cycle", PopCount(waiting_resp))
   XSPerfAccumulate("mem_count", mem.a.fire)
   for (i <- 0 until PtwWidth) {
-    XSPerfAccumulate(s"llptw_ppn_af${i}", mergeArb(i).in(outArbMqPort).valid && mergeArb(i).in(outArbMqPort).bits.s1.entry(OHToUInt(mergeArb(i).in(outArbMqPort).bits.s1.pteidx)).af && !llptw_out.bits.af)
+    XSPerfAccumulate(s"llptw_ppn_af${i}", mergeArb(i).in(outArbMqPort).fire && mergeArb(i).in(outArbMqPort).bits.s1.entry(OHToUInt(mergeArb(i).in(outArbMqPort).bits.s1.pteidx)).af && !llptw_out.bits.af)
     XSPerfAccumulate(s"access_fault${i}", io.tlb(i).resp.fire && io.tlb(i).resp.bits.s1.af)
   }
 
@@ -1118,16 +1137,6 @@ class BlockHelper(latency: Int)(implicit p: Parameters) extends XSModule {
   }
 }
 
-class PTEHelper() extends ExtModule {
-  val clock  = IO(Input(Clock()))
-  val enable = IO(Input(Bool()))
-  val satp   = IO(Input(UInt(64.W)))
-  val vpn    = IO(Input(UInt(64.W)))
-  val pte    = IO(Output(UInt(64.W)))
-  val level  = IO(Output(UInt(8.W)))
-  val pf     = IO(Output(UInt(8.W)))
-}
-
 class PTWDelayN[T <: Data](gen: T, n: Int, flush: Bool) extends Module {
   val io = IO(new Bundle() {
     val in = Input(gen)
@@ -1138,7 +1147,12 @@ class PTWDelayN[T <: Data](gen: T, n: Int, flush: Bool) extends Module {
   val t = RegInit(VecInit(Seq.fill(n)(0.U.asTypeOf(gen))))
   out(0) := io.in
   if (n == 1) {
-    io.out := out(0)
+    when (io.ptwflush) {
+      out(0) := 0.U.asTypeOf(gen)
+      io.out := 0.U.asTypeOf(gen)
+    }.otherwise {
+      io.out := out(0)
+    }
   } else {
     when (io.ptwflush) {
       for (i <- 0 until n) {
@@ -1165,48 +1179,73 @@ object PTWDelayN {
   }
 }
 
+// FakePTW: Software PTW implementation using DPI-C PteHelper
+// Used when coreParams.softPTW is enabled for debug/simulation
+// Supports H-extension two-stage address translation
 class FakePTW()(implicit p: Parameters) extends XSModule with HasPtwConst {
   val io = IO(new L2TLBIO)
+
   val flush = VecInit(Seq.fill(PtwWidth)(false.B))
-  flush(0) := DelayN(io.sfence.valid || io.csr.tlb.satp.changed || io.csr.tlb.vsatp.changed || io.csr.tlb.hgatp.changed || io.csr.tlb.priv.virt_changed, itlbParams.fenceDelay)
-  flush(1) := DelayN(io.sfence.valid || io.csr.tlb.satp.changed || io.csr.tlb.vsatp.changed || io.csr.tlb.hgatp.changed || io.csr.tlb.priv.virt_changed, ldtlbParams.fenceDelay)
+  val flushCond = io.sfence.valid ||
+    io.csr.tlb.satp.changed ||
+    io.csr.tlb.vsatp.changed ||
+    io.csr.tlb.hgatp.changed ||
+    io.csr.tlb.priv.virtChanged
+  flush(0) := DelayN(flushCond, itlbParams.fenceDelay)
+  flush(1) := DelayN(flushCond, ldtlbParams.fenceDelay)
+
   for (i <- 0 until PtwWidth) {
-    val helper = Module(new PTEHelper())
+    val helper = Module(new PteHelper())
     helper.clock := clock
-    helper.satp := io.csr.tlb.satp.ppn
+    helper.connectCsr(io.csr.tlb)
 
     if (coreParams.softPTWDelay == 1) {
-      helper.enable := io.tlb(i).req(0).fire
-      helper.vpn := io.tlb(i).req(0).bits.vpn
+      helper.connectReq(
+        reqVpn = io.tlb(i).req(0).bits.vpn,
+        reqS2xlate = io.tlb(i).req(0).bits.s2xlate,
+        reqEnable = io.tlb(i).req(0).fire && !reset.asBool
+      )
     } else {
-      helper.enable := PTWDelayN(io.tlb(i).req(0).fire, coreParams.softPTWDelay - 1, flush(i))
-      helper.vpn := PTWDelayN(io.tlb(i).req(0).bits.vpn, coreParams.softPTWDelay - 1, flush(i))
+      helper.connectReq(
+        reqVpn = PTWDelayN(io.tlb(i).req(0).bits.vpn, coreParams.softPTWDelay - 1, flush(i)),
+        reqS2xlate = PTWDelayN(io.tlb(i).req(0).bits.s2xlate, coreParams.softPTWDelay - 1, flush(i)),
+        reqEnable = PTWDelayN(io.tlb(i).req(0).fire, coreParams.softPTWDelay - 1, flush(i)) && !reset.asBool
+      )
     }
 
-    val pte = helper.pte.asTypeOf(new PteBundle)
-    val level = helper.level
-    val pf = helper.pf
+    val helperResult = PteHelperResult.fromHelper(helper, helper.enable)
+    val vpnDelayed = PTWDelayN(io.tlb(i).req(0).bits.vpn, coreParams.softPTWDelay, flush(i))
+    val s2xlateReg = if (coreParams.softPTWDelay == 1) {
+      RegEnable(io.tlb(i).req(0).bits.s2xlate, io.tlb(i).req(0).fire)
+    } else {
+      PTWDelayN(io.tlb(i).req(0).bits.s2xlate, coreParams.softPTWDelay, flush(i))
+    }
+
+    // Request/response handshake logic
     val empty = RegInit(true.B)
-    when (io.tlb(i).req(0).fire) {
+    when (flush(i)) {
+      empty := true.B
+    }.elsewhen (io.tlb(i).req(0).fire) {
       empty := false.B
-    } .elsewhen (io.tlb(i).resp.fire || flush(i)) {
+    }.elsewhen (io.tlb(i).resp.fire) {
       empty := true.B
     }
-
-    io.tlb(i).req(0).ready := empty || io.tlb(i).resp.fire
+    io.tlb(i).req(0).ready := !flush(i) && (empty || io.tlb(i).resp.fire)
     io.tlb(i).resp.valid := PTWDelayN(io.tlb(i).req(0).fire, coreParams.softPTWDelay, flush(i))
     assert(!io.tlb(i).resp.valid || io.tlb(i).resp.ready)
-    io.tlb(i).resp.bits.s1.entry.tag := PTWDelayN(io.tlb(i).req(0).bits.vpn, coreParams.softPTWDelay, flush(i))
-    io.tlb(i).resp.bits.s1.entry.pbmt := pte.pbmt
-    io.tlb(i).resp.bits.s1.entry.ppn := pte.ppn
-    io.tlb(i).resp.bits.s1.entry.perm.map(_ := pte.getPerm())
-    io.tlb(i).resp.bits.s1.entry.level.map(_ := level)
-    io.tlb(i).resp.bits.s1.pf := pf
-    io.tlb(i).resp.bits.s1.af := DontCare // TODO: implement it
-    io.tlb(i).resp.bits.s1.entry.v := !pf
-    io.tlb(i).resp.bits.s1.entry.prefetch := DontCare
-    io.tlb(i).resp.bits.s1.entry.asid := io.csr.tlb.satp.asid
+
+    helperResult.fillS1Resp(
+      resp = io.tlb(i).resp.bits.s1,
+      vpn = vpnDelayed,
+      s2xlate = s2xlateReg,
+      asid = io.csr.tlb.satp.asid,
+      vsasid = io.csr.tlb.vsatp.asid,
+      vmid = io.csr.tlb.hgatp.vmid
+    )
+    helperResult.fillS2Resp(io.tlb(i).resp.bits.s2, vpnDelayed, s2xlateReg, io.csr.tlb.hgatp.vmid)
+    io.tlb(i).resp.bits.s2xlate := s2xlateReg
   }
+  io.wfi.wfiSafe := true.B
 }
 
 class L2TLBWrapper()(implicit p: Parameters) extends LazyModule with HasXSParameter {
@@ -1221,13 +1260,12 @@ class L2TLBWrapper()(implicit p: Parameters) extends LazyModule with HasXSParame
   class L2TLBWrapperImp(wrapper: LazyModule) extends LazyModuleImp(wrapper) with HasPerfEvents {
     val io = IO(new L2TLBIO)
     val perfEvents = if (useSoftPTW) {
-      val fake_ptw = Module(new FakePTW())
-      io <> fake_ptw.io
+      val fakePtw = Module(new FakePTW())
+      io <> fakePtw.io
       Seq()
-    }
-    else {
-        io <> ptw.module.io
-        ptw.module.getPerfEvents
+    } else {
+      io <> ptw.module.io
+      ptw.module.getPerfEvents
     }
     generatePerfEvent()
   }

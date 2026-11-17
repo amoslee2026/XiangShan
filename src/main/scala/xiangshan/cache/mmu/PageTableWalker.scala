@@ -125,7 +125,7 @@ class PTW()(implicit p: Parameters) extends XSModule with HasPtwConst with HasPe
   val current_mode = current_satp.mode
   val mode = satp.mode
   val hgatp = io.csr.hgatp
-  val flush = io.sfence.valid || io.csr.satp.changed || io.csr.vsatp.changed || io.csr.hgatp.changed || io.csr.priv.virt_changed || (if (HasMptCheck) io.csr.mmpt.changed else false.B)
+  val flush = io.sfence.valid || io.csr.satp.changed || io.csr.vsatp.changed || io.csr.hgatp.changed || io.csr.priv.virtChanged || (if (HasMptCheck) io.csr.mmpt.changed else false.B)
   // changes in mpt flush all
   val s2xlate = enableS2xlate && !onlyS1xlate
   val level = RegInit(3.U(log2Up(Level + 1).W))
@@ -207,11 +207,7 @@ class PTW()(implicit p: Parameters) extends XSModule with HasPtwConst with HasPe
 
   l3addr := MakeAddr(satp.ppn, getVpnn(vpn, 3))
   if (EnableSv48) {
-    when (mode === Sv48) {
-      l2addr := MakeAddr(Mux(l3Hit, ppn, pte.getPPN()), getVpnn(vpn, 2))
-    } .otherwise {
-      l2addr := MakeAddr(satp.ppn, getVpnn(vpn, 2))
-    }
+    l2addr := MakeAddr(Mux(l3Hit || !pte_valid, ppn, pte.getPPN()), getVpnn(vpn, 2))
   } else {
     l2addr := MakeAddr(satp.ppn, getVpnn(vpn, 2))
   }
@@ -437,7 +433,7 @@ class PTW()(implicit p: Parameters) extends XSModule with HasPtwConst with HasPe
 
   when(io.hptw.resp.fire && w_hptw_resp === false.B) {
     w_hptw_resp := true.B
-    val g_perm_fail = !io.hptw.resp.bits.h_resp.gaf && (!io.hptw.resp.bits.h_resp.entry.perm.get.r && !(io.csr.priv.mxr && io.hptw.resp.bits.h_resp.entry.perm.get.x))
+    val g_perm_fail = !io.hptw.resp.bits.h_resp.gaf && !io.hptw.resp.bits.h_resp.entry.perm.get.r
     hptw_pageFault := io.hptw.resp.bits.h_resp.gpf || g_perm_fail
     hptw_accessFault := io.hptw.resp.bits.h_resp.gaf
     hptw_resp := io.hptw.resp.bits.h_resp
@@ -609,7 +605,11 @@ class PTW()(implicit p: Parameters) extends XSModule with HasPtwConst with HasPe
         vs_finish := true.B
       }.otherwise{
         if (HasMptCheck) {
-          s_mpt_check := true.B // mem_addr_update checks pmp, next is mpt or mem access state
+          when(mptEn && checkIntermediateNode) {
+            s_mpt_check := true.B
+          }.otherwise {
+            s_mem_req := false.B
+          }
         }else{
           s_mem_req := false.B
         } // that is not intended for mpt
@@ -679,17 +679,22 @@ class PTW()(implicit p: Parameters) extends XSModule with HasPtwConst with HasPe
   XSDebug(p"[ptw] level:${level} notFound:${pageFault}\n")
 
   // perf
-  XSPerfAccumulate("fsm_count", io.req.fire)
-  for (i <- 0 until PtwWidth) {
-    XSPerfAccumulate(s"fsm_count_source${i}", io.req.fire && io.req.bits.req_info.source === i.U)
+  XSPerfAccumulate("ptw_fsm_req_count", io.req.fire)
+  for (i <- 0 until sourceWidth) {
+    XSPerfAccumulate(s"ptw_fsm_req_count_source${i}", io.req.fire && io.req.bits.req_info.source === i.U)
   }
-  XSPerfAccumulate("fsm_busy", !idle)
-  XSPerfAccumulate("fsm_idle", idle)
-  XSPerfAccumulate("resp_blocked", io.resp.valid && !io.resp.ready)
-  XSPerfAccumulate("ptw_ppn_af", io.resp.fire && ppn_af)
-  XSPerfAccumulate("mem_count", mem.req.fire)
-  XSPerfAccumulate("mem_cycle", BoolStopWatch(mem.req.fire, mem.resp.fire, true))
-  XSPerfAccumulate("mem_blocked", mem.req.valid && !mem.req.ready)
+  XSPerfAccumulate("ptw_fsm_busy_cycle", !idle)
+  XSPerfAccumulate("ptw_fsm_idle_cycle", idle)
+  XSPerfAccumulate("ptw_fsm_resp_blocked_cycle", io.resp.valid && !io.resp.ready)
+  XSPerfAccumulate("ptw_ppn_af_count", io.resp.fire && ppn_af)
+  XSPerfAccumulate("ptw_resp_count", io.resp.fire)
+  XSPerfAccumulate("ptw_hptw_req_count", io.hptw.req.fire)
+  XSPerfAccumulate("ptw_mem_req_count", mem.req.fire)
+  for (i <- 0 until sourceWidth) {
+    XSPerfAccumulate(s"ptw_mem_req_count_source${i}", mem.req.fire && source === i.U)
+  }
+  XSPerfAccumulate("ptw_mem_wait_cycle", BoolStopWatch(mem.req.fire, mem.resp.fire, true))
+  XSPerfAccumulate("ptw_mem_req_blocked_cycle", mem.req.valid && !mem.req.ready)
 
   val perfEvents = Seq(
     ("fsm_count         ", io.req.fire                                     ),
@@ -799,7 +804,7 @@ class LLPTW(implicit p: Parameters) extends XSModule with HasPtwConst with HasPe
   val mbmc = io.csr.mbmc
   val bitmap_enable = (if (HasBitmapCheck) true.B else false.B) && mbmc.BME === 1.U && mbmc.CMODE === 0.U
 
-  val flush = io.sfence.valid || io.csr.satp.changed || io.csr.vsatp.changed || io.csr.hgatp.changed || io.csr.priv.virt_changed || (if (HasMptCheck) io.csr.mmpt.changed else false.B)
+  val flush = io.sfence.valid || io.csr.satp.changed || io.csr.vsatp.changed || io.csr.hgatp.changed || io.csr.priv.virtChanged || (if (HasMptCheck) io.csr.mmpt.changed else false.B)
   val entries = RegInit(VecInit(Seq.fill(l2tlbParams.llptwsize)(0.U.asTypeOf(new LLPTWEntry()))))
   val state_idle :: state_hptw_req :: state_hptw_resp :: state_addr_check :: state_mem_req :: state_mem_waiting :: state_mem_out :: state_last_hptw_req :: state_last_hptw_resp :: state_cache :: state_bitmap_check :: state_bitmap_resp :: stage_mpt_req ::stage_mpt_resp :: Nil = Enum(14)
   val state = RegInit(VecInit(Seq.fill(l2tlbParams.llptwsize)(state_idle)))
@@ -858,7 +863,7 @@ class LLPTW(implicit p: Parameters) extends XSModule with HasPtwConst with HasPe
   }
 
 
-  val bitmap_arb = Option.when(HasBitmapCheck)(Module(new RRArbiterInit(new bitmapReqBundle(), l2tlbParams.llptwsize)))
+  val bitmap_arb = Option.when(HasBitmapCheck)(Module(new TwoLevelRRArbiter(new bitmapReqBundle(), l2tlbParams.llptwsize)))
   val way_info = Option.when(HasBitmapCheck)(Wire(Vec(l2tlbParams.llptwsize, UInt(l2tlbParams.l0nWays.W))))
   if (HasBitmapCheck) {
     for (i <- 0 until l2tlbParams.llptwsize) {
@@ -1160,7 +1165,7 @@ class LLPTW(implicit p: Parameters) extends XSModule with HasPtwConst with HasPe
   when (io.hptw.resp.fire) {
     for (i <- state.indices) {
       when (state(i) === state_hptw_resp && io.hptw.resp.bits.id === entries(i).wait_id && io.hptw.resp.bits.h_resp.entry.tag === entries(i).ppn) {
-        val check_g_perm_fail = !io.hptw.resp.bits.h_resp.gaf && (!io.hptw.resp.bits.h_resp.entry.perm.get.r && !(io.csr.priv.mxr && io.hptw.resp.bits.h_resp.entry.perm.get.x))
+        val check_g_perm_fail = !io.hptw.resp.bits.h_resp.gaf && !io.hptw.resp.bits.h_resp.entry.perm.get.r
         when (check_g_perm_fail || io.hptw.resp.bits.h_resp.gaf || io.hptw.resp.bits.h_resp.gpf) {
           state(i) := state_mem_out
           entries(i).hptw_resp := io.hptw.resp.bits.h_resp
@@ -1299,18 +1304,18 @@ class LLPTW(implicit p: Parameters) extends XSModule with HasPtwConst with HasPe
   }
 
   XSPerfAccumulate("llptw_in_count", io.in.fire)
-  XSPerfAccumulate("llptw_in_block", io.in.valid && !io.in.ready)
-  for (i <- 0 until 7) {
-    XSPerfAccumulate(s"enq_state${i}", io.in.fire && enq_state === i.U)
+  XSPerfAccumulate("llptw_in_blocked_cycle", io.in.valid && !io.in.ready)
+  XSPerfAccumulate("llptw_mem_req_count", io.mem.req.fire)
+  XSPerfAccumulate("llptw_mem_busy_cycle", PopCount(is_waiting) =/= 0.U)
+  XSPerfAccumulate("llptw_entry_occupancy_cycle", PopCount(is_emptys.map(!_)))
+  XSPerfAccumulate("llptw_mem_wait_entry_cycle", PopCount(is_waiting))
+  for (i <- 0 until sourceWidth) {
+    XSPerfAccumulate(s"llptw_in_count_source${i}", io.in.fire && io.in.bits.req_info.source === i.U)
+    XSPerfAccumulate(s"llptw_mem_req_count_source${i}", io.mem.req.fire && mem_arb.io.out.bits.req_info.source === i.U)
   }
-  for (i <- 0 until (l2tlbParams.llptwsize + 1)) {
-    XSPerfAccumulate(s"util${i}", PopCount(is_emptys.map(!_)) === i.U)
-    XSPerfAccumulate(s"mem_util${i}", PopCount(is_mems) === i.U)
-    XSPerfAccumulate(s"waiting_util${i}", PopCount(is_waiting) === i.U)
-  }
-  XSPerfAccumulate("mem_count", io.mem.req.fire)
-  XSPerfAccumulate("mem_cycle", PopCount(is_waiting) =/= 0.U)
-  XSPerfAccumulate("blocked_in", io.in.valid && !io.in.ready)
+  XSPerfAccumulate("llptw_out_count", io.out.fire)
+  XSPerfAccumulate("llptw_cache_retry_count", io.cache.fire)
+  XSPerfAccumulate("llptw_hptw_req_count", io.hptw.req.fire)
 
   val perfEvents = Seq(
     ("tlbllptw_incount           ", io.in.fire               ),
@@ -1384,7 +1389,7 @@ class HPTW()(implicit p: Parameters) extends XSModule with HasPtwConst {
   val hgatp = io.csr.hgatp
   val mpbmte = io.csr.mPBMTE
   val sfence = io.sfence
-  val flush = sfence.valid || hgatp.changed || io.csr.satp.changed || io.csr.vsatp.changed || io.csr.priv.virt_changed || (if (HasMptCheck) io.csr.mmpt.changed else false.B)
+  val flush = sfence.valid || hgatp.changed || io.csr.satp.changed || io.csr.vsatp.changed || io.csr.priv.virtChanged || (if (HasMptCheck) io.csr.mmpt.changed else false.B)
   val mode = hgatp.mode
 
   val mptEn = if (HasMptCheck) (io.csr.mmpt.mode =/= 0.U) else false.B // mpt bare mode will generate the circuit but not using it
@@ -1666,7 +1671,11 @@ class HPTW()(implicit p: Parameters) extends XSModule with HasPtwConst {
     when(!(find_pte || accessFaultMpt)) {
       level := levelNext
       if (HasMptCheck) {
-        s_mpt_check := true.B // mem_addr_update checks pmp, next is mpt or mem access state
+        when(mptEn && checkIntermediateNode) {
+          s_mpt_check := true.B
+        }.otherwise {
+          s_mem_req := false.B
+        }
       } else {
         s_mem_req := false.B
       }
@@ -1705,4 +1714,12 @@ class HPTW()(implicit p: Parameters) extends XSModule with HasPtwConst {
       bitmap_checkfailed := false.B
     }
   }
+
+  XSPerfAccumulate("hptw_req_count", io.req.fire)
+  XSPerfAccumulate("hptw_req_blocked_cycle", io.req.valid && !io.req.ready)
+  XSPerfAccumulate("hptw_busy_cycle", !idle)
+  XSPerfAccumulate("hptw_resp_count", io.resp.fire)
+  XSPerfAccumulate("hptw_mem_req_count", io.mem.req.fire)
+  XSPerfAccumulate("hptw_mem_req_blocked_cycle", io.mem.req.valid && !io.mem.req.ready)
+
 }

@@ -20,7 +20,7 @@ import chisel3.util._
 import org.chipsalliance.cde.config.Parameters
 import utility.CircularQueuePtr
 import xiangshan.XSCoreParamsKey
-import xiangshan.frontend.PrunedAddr
+import xiangshan.frontend.Pc
 import xiangshan.frontend.bpu.BranchAttribute
 import xiangshan.frontend.bpu.Prediction
 
@@ -29,19 +29,23 @@ class CommonHREntry(implicit p: Parameters) extends CommonHRBundle {
   val ghr:   UInt = UInt(GhrHistoryLength.W)
   val bw:    UInt = UInt(BWHistoryLength.W)
 
-  val predStartPc: Option[PrunedAddr] = Some(PrunedAddr(VAddrBits)) // for debug
+  val predStartPc: Option[Pc] = Some(Pc()) // for debug
 }
-class CommonHRUpdate(implicit p: Parameters) extends CommonHRBundle {
-  val taken:              Bool                 = Bool()
-  val s3Override:         Bool                 = Bool()
-  val condHitMask:        Vec[Bool]            = Vec(NumBtbResultEntries, Bool())
-  val position:           Vec[UInt]            = Vec(NumBtbResultEntries, UInt(CfiPositionWidth.W))
-  val attributes:         Vec[BranchAttribute] = Vec(NumBtbResultEntries, new BranchAttribute)
-  val targets:            Vec[PrunedAddr]      = Vec(NumBtbResultEntries, PrunedAddr(VAddrBits))
-  val firstTakenBranchOH: Vec[Bool]            = Vec(NumBtbResultEntries, Bool())
-  val firstTakenBranch:   Valid[Prediction]    = Valid(new Prediction)
-  val startPc:            PrunedAddr           = PrunedAddr(VAddrBits)
-  val target:             PrunedAddr           = PrunedAddr(VAddrBits)
+
+class Update(implicit p: Parameters) extends CommonHRBundle {
+  val isOverride: Bool       = Bool()
+  val startPc:    Pc         = Pc()
+  val prediction: Prediction = new Prediction()
+}
+
+class S2Update(implicit p: Parameters) extends Update {
+  val condHitMask: Vec[Bool] = Vec(NumBtbResultEntries, Bool())
+  val positions:   Vec[UInt] = Vec(NumBtbResultEntries, UInt(CfiPositionWidth.W))
+  val targets:     Vec[Pc]   = Vec(NumBtbResultEntries, Pc())
+}
+
+class S3Update(implicit p: Parameters) extends Update {
+  val firstTakenBranchOH: Vec[Bool] = Vec(NumBtbResultEntries, Bool())
 }
 
 class CommonHRResolveMeta(implicit p: Parameters) extends CommonHRBundle {
@@ -62,10 +66,10 @@ class CommonHRMeta(implicit p: Parameters) extends CommonHRBundle {
 
 class CommonHRRedirect(implicit p: Parameters) extends CommonHRBundle {
   val valid:     Bool            = Bool()
-  val cfiPc:     PrunedAddr      = PrunedAddr(VAddrBits)
+  val cfiPc:     Pc              = Pc()
   val taken:     Bool            = Bool()
   val attribute: BranchAttribute = new BranchAttribute
-  val target:    PrunedAddr      = PrunedAddr(VAddrBits)
+  val target:    Pc              = Pc()
   val meta:      CommonHRMeta    = new CommonHRMeta
 }
 

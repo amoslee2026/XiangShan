@@ -19,7 +19,7 @@ import chisel3._
 import chisel3.util._
 import org.chipsalliance.cde.config.Parameters
 import xiangshan.XSCoreParamsKey
-import xiangshan.frontend.PrunedAddr
+import xiangshan.frontend.Pc
 import xiangshan.frontend.bpu.SaturateCounter
 import xiangshan.frontend.bpu.SaturateCounterFactory
 import xiangshan.frontend.bpu.SaturateCounterInit
@@ -70,20 +70,20 @@ class ScMeta(implicit p: Parameters) extends ScBundle with HasScParameters {
   // NOTE: Seems ChiselDB has problem dealing with SInt, so we do not use ScEntry for scResp here
   // FIXME: is there a better way to do this?
   private def ScEntryWidth = (new ScEntry).getWidth
-  val scBiasLowerBits: Vec[UInt] = Vec(NumWays, UInt(BiasUseTageBitWidth.W))
-  val scPred:          Vec[Bool] = Vec(NumWays, Bool())
+  val scBiasLowerBits: Vec[UInt] = Vec(NumBtbResultEntries, UInt(BiasUseTageBitWidth.W))
+  val scPred:          Vec[Bool] = Vec(NumBtbResultEntries, Bool())
   val tagePred:        Vec[Bool] = Vec(NumBtbResultEntries, Bool())
   val tageCtr:         Vec[UInt] = Vec(NumBtbResultEntries, UInt(TageTakenCtrWidth.W))
   val tagePredValid:   Vec[Bool] = Vec(NumBtbResultEntries, Bool())
-  val useScPred:       Vec[Bool] = Vec(NumWays, Bool())
-  val sumAboveThres:   Vec[Bool] = Vec(NumWays, Bool())
+  val useScPred:       Vec[Bool] = Vec(NumBtbResultEntries, Bool())
+  val sumAboveThres:   Vec[Bool] = Vec(NumBtbResultEntries, Bool())
 
   // for debug
-  val debug_scPathTakenVec:   Option[Vec[Bool]] = Some(Vec(NumWays, Bool()))
-  val debug_scGlobalTakenVec: Option[Vec[Bool]] = Some(Vec(NumWays, Bool()))
-  val debug_scBWTakenVec:     Option[Vec[Bool]] = Some(Vec(NumWays, Bool()))
-  val debug_scImliTakenVec:   Option[Vec[Bool]] = Some(Vec(NumWays, Bool()))
-  val debug_scBiasTakenVec:   Option[Vec[Bool]] = Some(Vec(NumWays, Bool()))
+  val debug_scPathTakenVec:   Option[Vec[Bool]] = Some(Vec(NumBtbResultEntries, Bool()))
+  val debug_scGlobalTakenVec: Option[Vec[Bool]] = Some(Vec(NumBtbResultEntries, Bool()))
+  val debug_scBWTakenVec:     Option[Vec[Bool]] = Some(Vec(NumBtbResultEntries, Bool()))
+  val debug_scImliTakenVec:   Option[Vec[Bool]] = Some(Vec(NumBtbResultEntries, Bool()))
+  val debug_scBiasTakenVec:   Option[Vec[Bool]] = Some(Vec(NumBtbResultEntries, Bool()))
   val debug_predPathIdx: Option[MixedVec[UInt]] =
     Some(MixedVec(PathTableInfos.map(info => UInt(log2Ceil(info.NumSets).W))))
   val debug_predGlobalIdx: Option[MixedVec[UInt]] =
@@ -96,8 +96,8 @@ class ScMeta(implicit p: Parameters) extends ScBundle with HasScParameters {
 
 class ScConditionalBranchTrace(implicit p: Parameters) extends ScBundle with HasScParameters {
   private def ScEntryWidth = (new ScEntry).getWidth
-  val startPc: PrunedAddr = PrunedAddr(VAddrBits)
-  val cfiPc:   UInt       = UInt(VAddrBits.W)
+  val startPc: Pc   = Pc()
+  val cfiPc:   UInt = UInt(VAddrBits.W)
   // tage provider info
   val providerValid: Bool = Bool()
   val providerTaken: Bool = Bool()

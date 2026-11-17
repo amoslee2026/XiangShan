@@ -27,7 +27,8 @@ import sys
 import time
 import shlex
 import psutil
-import re
+import pathlib
+from typing import List, Tuple, Set
 
 def find_files_with_suffix(root_dir, suffixes):
     matching_files = []
@@ -51,7 +52,6 @@ class XSArgs(object):
     nemu_home = os.path.join(noop_home, "../NEMU")
     am_home = os.path.join(noop_home, "../nexus-am")
     dramsim3_home = os.path.join(noop_home, "../DRAMsim3")
-    rvtest_home = os.path.join(noop_home, "../riscv-tests")
     default_wave_home = os.path.join(noop_home, "build")
     wave_home   = default_wave_home
 
@@ -63,7 +63,6 @@ class XSArgs(object):
             (args.nemu, "NEMU_HOME", self.nemu_home, self.set_nemu_home),
             (args.am, "AM_HOME", self.am_home, self.set_am_home),
             (args.dramsim3, "DRAMSIM3_HOME", self.dramsim3_home, self.set_dramsim3_home),
-            (args.rvtest, "RVTEST_HOME", self.rvtest_home, self.set_rvtest_home),
         ]
         for (arg_in, env, default, set_func) in all_path:
             set_func(self.__extract_path(arg_in, env, default))
@@ -85,6 +84,7 @@ class XSArgs(object):
         self.emu_optimize = args.emu_optimize
         self.xprop = 1 if args.xprop else None
         self.issue = args.issue
+        self.llc = args.llc
         self.with_chiseldb = 1 if args.enable_db or args.enable_rolling else 0
         self.with_rollingdb = 1 if args.enable_rolling else None
         # emu arguments
@@ -92,6 +92,7 @@ class XSArgs(object):
         self.ram_size = args.ram_size
         self.seed = args.seed if args.seed is not None else random.randint(0, 9999)
         self.numa = args.numa
+        self.numa_max_retry = args.numa_max_retry
         self.diff = args.diff
         if args.spike and "nemu" in args.diff:
             self.diff = self.diff.replace("nemu-interpreter", "spike")
@@ -155,6 +156,7 @@ class XSArgs(object):
             (self.pgo_emu_args,  "PGO_EMU_ARGS"),
             (self.llvm_profdata, "LLVM_PROFDATA"),
             (self.issue,         "ISSUE"),
+            (self.llc,           "LLC"),
             (self.simfrontend,   "ENABLE_SIMFRONTEND"),
             (self.emu_trace_all, "EMU_TRACE_ALL"),
         ]
@@ -211,9 +213,6 @@ class XSArgs(object):
     def set_dramsim3_home(self, path):
         self.dramsim3_home = path
 
-    def set_rvtest_home(self, path):
-        self.rvtest_home = path
-
     def set_wave_home(self, path):
         print(f"set wave home to {path}")
         self.wave_home = path
@@ -224,6 +223,8 @@ class XiangShan(object):
         self.args = XSArgs(args)
         self.timeout = args.timeout
         self.numa_info = None
+        self.isa_smoke_runlist = args.isa_smoke_runlist
+        self.isa_smoke_extension = args.isa_smoke_extension
 
     def show(self):
         self.args.show()
@@ -289,7 +290,7 @@ class XiangShan(object):
         numa_args = ""
         if self.args.numa:
             if self.numa_info is None:
-                self.numa_info = get_free_cores(self.args.threads)
+                self.numa_info = get_free_cores(self.args.threads, self.args.numa_max_retry)
             numa_args = f"numactl -m {self.numa_info[0]} -C {self.numa_info[1]}-{self.numa_info[2]}"
         fork_args = "--enable-fork" if self.args.fork else ""
         diff_args = "--no-diff" if self.args.disable_diff else ""
@@ -297,7 +298,7 @@ class XiangShan(object):
         instr_trace_args = f"--instr-trace {instr_trace}" if instr_trace_valid else ""
         gcpt_restore_args = f"-r {self.args.gcpt_restore_bin}" if len(self.args.gcpt_restore_bin) != 0 else ""
         flash_args = f"--flash {self.args.flash}" if self.args.flash is not None else ""
-        return_code = self.__exec_cmd(f'ulimit -s {32 * 1024}; {numa_args} $NOOP_HOME/build/emu -i {workload} {emu_args} {fork_args} {diff_args} {chiseldb_args} {gcpt_restore_args} {instr_trace_args} {flash_args}')
+        return_code = self.__exec_cmd(f'ulimit -s {32 * 1024}; {numa_args} $NOOP_HOME/build/emu -i {shlex.quote(workload)} {emu_args} {fork_args} {diff_args} {chiseldb_args} {gcpt_restore_args} {instr_trace_args} {flash_args}')
         return return_code
 
     def run_simv(self, workload):
@@ -349,22 +350,30 @@ class XiangShan(object):
             print(f"KeyboardInterrupt or TimeoutExpired.")
             return 0
 
-    def __get_ci_cputest(self, name=None):
-        # base_dir = os.path.join(self.args.am_home, "tests/cputest/build")
-        base_dir = "/nfs/home/share/ci-workloads/nexus-am-workloads/tests/cputest"
-        cputest = os.listdir(base_dir)
-        cputest = filter(lambda x: x.endswith(".bin"), cputest)
-        cputest = map(lambda x: os.path.join(base_dir, x), cputest)
-        return cputest
-
-    def __get_ci_rvtest(self, name=None):
-        base_dir = os.path.join(self.args.rvtest_home, "isa/build")
-        riscv_tests = os.listdir(base_dir)
-        riscv_tests = filter(lambda x: x.endswith(".bin"), riscv_tests)
-        all_rv_tests = ["rv64ui", "rv64um", "rv64ua", "rv64uf", "rv64ud", "rv64mi"]
-        riscv_tests = filter(lambda x: x[:6] in all_rv_tests, riscv_tests)
-        riscv_tests = map(lambda x: os.path.join(base_dir, x), riscv_tests)
-        return riscv_tests
+    def __get_ci_isa_smoke(self, name=None):
+        runlist_path = os.path.realpath(self.isa_smoke_runlist)
+        with open(runlist_path) as f:
+            runlist = json.load(f)
+        base_dir = os.path.normpath(os.path.join(os.path.dirname(runlist_path), runlist["binary_base"]))
+        extension_name = self.isa_smoke_extension
+        extensions = runlist["extensions"]
+        if extension_name is not None:
+            extensions = [extension for extension in extensions if extension["name"] == extension_name]
+            if not extensions:
+                raise ValueError(f"Unknown ISA smoke extension: {extension_name}")
+        workloads = [
+            os.path.join(base_dir, item["binary"])
+            for extension in extensions if extension["enabled"]
+            for item in extension["tests"] if item["enabled"]
+        ]
+        if not workloads:
+            if extension_name is None:
+                raise ValueError("ISA smoke runlist selects no tests")
+            print(f"Skipping ISA smoke extension with no enabled tests: {extension_name}")
+        for workload in workloads:
+            if not workload.endswith(".bin") or not os.path.isfile(workload):
+                raise ValueError(f"Missing or invalid ISA smoke binary: {workload}")
+        return workloads
 
     def __get_ci_misc(self, name=None):
         base_dir = "/nfs/home/share/ci-workloads"
@@ -526,14 +535,6 @@ class XiangShan(object):
         f16_test = map(lambda x: os.path.join(base_dir, x), workloads)
         return f16_test
 
-    def __get_ci_zcbtest(self, name=None):
-        base_dir = "/nfs/home/share/ci-workloads/zcb-test"
-        workloads = [
-            "zcb-test-riscv64-xs.bin"
-        ]
-        zcb_test = map(lambda x: os.path.join(base_dir, x), workloads)
-        return zcb_test
-
     def __get_ci_iopmptest(self, name=None):
         base_dir = "/nfs/home/share/ci-workloads/iopmp"
         workloads = [
@@ -542,19 +543,37 @@ class XiangShan(object):
         iopmp_test = map(lambda x: os.path.join(base_dir, x), workloads)
         return iopmp_test
 
-    def __get_ci_crosspage_fetch_test(self, name=None):
-        base_dir = "/nfs/home/share/ci-workloads/crosspage-fetch"
+    def __get_ci_frontend_misc_test(self, name=None):
+        base_dir = "/nfs/home/share/ci-workloads/frontend"
         workloads = [
-            "crosspage_pad2b_page1_exec_page2_exec-riscv64-xs.bin",       # normal
-            "crosspage_pad2b_page1_exec_page2_exec_io-riscv64-xs.bin",    # normal -> mmio
-            "crosspage_pad2b_page1_exec_page2_none-riscv64-xs.bin",       # normal -> page fault
-            "crosspage_pad2b_page1_exec_page2_io-riscv64-xs.bin",         # normal -> mmio page fault
-            "crosspage_pad2b_page1_exec_io_page2_exec-riscv64-xs.bin",    # mmio -> normal
-            "crosspage_pad2b_page1_exec_io_page2_exec_io-riscv64-xs.bin", # mmio
-            "crosspage_pad2b_page1_exec_io_page2_none-riscv64-xs.bin",    # mmio -> page fault
-            "crosspage_pad2b_page1_exec_io_page2_io-riscv64-xs.bin",      # mmio -> mmio page fault
-            "crosspage_pad2b_page1_none_page2_exec-riscv64-xs.bin",       # page fault
-            "crosspage_pad2b_page1_none_page2_exec_io-riscv64-xs.bin",    # page fault -> mmio
+            # test single instruction fetch across page boundary, with different combinations of page attributes/permissions
+            "crosspage-fetch/pad2b_page1_exec_page2_exec-riscv64-xs.bin",       # normal
+            "crosspage-fetch/pad2b_page1_exec_page2_exec_io-riscv64-xs.bin",    # normal -> mmio
+            "crosspage-fetch/pad2b_page1_exec_page2_none-riscv64-xs.bin",       # normal -> page fault
+            "crosspage-fetch/pad2b_page1_exec_page2_io-riscv64-xs.bin",         # normal -> mmio page fault
+            "crosspage-fetch/pad2b_page1_exec_io_page2_exec-riscv64-xs.bin",    # mmio -> normal
+            "crosspage-fetch/pad2b_page1_exec_io_page2_exec_io-riscv64-xs.bin", # mmio
+            "crosspage-fetch/pad2b_page1_exec_io_page2_none-riscv64-xs.bin",    # mmio -> page fault
+            "crosspage-fetch/pad2b_page1_exec_io_page2_io-riscv64-xs.bin",      # mmio -> mmio page fault
+            "crosspage-fetch/pad2b_page1_none_page2_exec-riscv64-xs.bin",       # page fault
+            "crosspage-fetch/pad2b_page1_none_page2_exec_io-riscv64-xs.bin",    # page fault -> mmio
+            # test fetching from non-canonical pc
+            "fetch-canonical-check-test/sv39-riscv64-xs.bin",          # fall-through to a non-canonical pc (bpu)
+            "fetch-canonical-check-test/sv39-half-rvi-riscv64-xs.bin", # fall-through to a non-canonical pc (bpu), with a rvi crossing page
+            "fetch-canonical-check-test/sv39-beqz-riscv64-xs.bin",     # branch to a non-canonical pc (branchUnit)
+            "fetch-canonical-check-test/sv39-jal-riscv64-xs.bin",      # jump to a non-canonical pc (ifu)
+            "fetch-canonical-check-test/sv39-jalr-riscv64-xs.bin",     # indirect jump to a non-canonical pc (jumpUnit)
+            "fetch-canonical-check-test/sv39-mret-riscv64-xs.bin",     # mret to a non-canonical pc (csr)
+            "fetch-canonical-check-test/sv39-sret-riscv64-xs.bin",     # sret to a non-canonical pc (csr)
+            # test fetching from non-canonical pc again, but in sv48x4 mode
+            "fetch-canonical-check-test/sv48x4-riscv64-xs.bin",
+            "fetch-canonical-check-test/sv48x4-half-rvi-riscv64-xs.bin",
+            "fetch-canonical-check-test/sv48x4-beqz-riscv64-xs.bin",
+            "fetch-canonical-check-test/sv48x4-jal-riscv64-xs.bin",
+            "fetch-canonical-check-test/sv48x4-jalr-riscv64-xs.bin",
+            "fetch-canonical-check-test/sv48x4-mret-riscv64-xs.bin",
+            "fetch-canonical-check-test/sv48x4-sret-riscv64-xs.bin",
+            # we also have sv39x4, sv48, sv57, but 39 and 48x4 should cover all situation, so these are not included in the ci test.
         ]
         return map(lambda x: os.path.join(base_dir, x), workloads)
 
@@ -630,8 +649,7 @@ class XiangShan(object):
 
     def run_ci(self, test):
         all_tests = {
-            "cputest": self.__get_ci_cputest,
-            "riscv-tests": self.__get_ci_rvtest,
+            "isa-smoke": self.__get_ci_isa_smoke,
             "misc-tests": self.__get_ci_misc,
             "mc-tests": self.__get_ci_mc,
             "nodiff-tests": self.__get_ci_nodiff,
@@ -643,14 +661,14 @@ class XiangShan(object):
             # "rvv-bench": self.__get_ci_rvvbench,
             # "rvv-test": self.__get_ci_rvvtest,
             "f16_test": self.__get_ci_F16test,
-            "zcb-test": self.__get_ci_zcbtest,
             "iopmp-test": self.__get_ci_iopmptest,
-            "crosspage-fetch-test": self.__get_ci_crosspage_fetch_test,
+            "frontend-misc-test": self.__get_ci_frontend_misc_test,
         }
         for target in all_tests.get(test, self.__get_ci_workloads)(test):
             print(target)
             ret = self.run_emu(target)
             if ret:
+                print(f"Failed workload: {target} (exit code: {ret})")
                 if self.args.default_wave_home != self.args.wave_home:
                     print("copy wave file to " + self.args.wave_home)
                     self.__exec_cmd(f"cp $NOOP_HOME/build/*.vcd $WAVE_HOME")
@@ -663,8 +681,6 @@ class XiangShan(object):
 
     def run_ci_vcs(self, test):
         all_tests = {
-            "cputest": self.__get_ci_cputest,
-            "riscv-tests": self.__get_ci_rvtest,
             "misc-tests": self.__get_ci_misc,
             "mc-tests": self.__get_ci_mc,
             "nodiff-tests": self.__get_ci_nodiff,
@@ -676,9 +692,8 @@ class XiangShan(object):
             # "rvv-bench": self.__get_ci_rvvbench,
             # "rvv-test": self.__get_ci_rvvtest,
             "f16_test": self.__get_ci_F16test,
-            "zcb-test": self.__get_ci_zcbtest,
             "iopmp-test": self.__get_ci_iopmptest,
-            "crosspage-fetch-test": self.__get_ci_crosspage_fetch_test,
+            "frontend-misc-test": self.__get_ci_frontend_misc_test,
         }
         for target in all_tests.get(test, self.__get_ci_workloads)(test):
             print(target)
@@ -693,88 +708,99 @@ class XiangShan(object):
                 return ret
         return 0
 
-def get_free_cores(n):
-    def numa_count():
-        node_dir = "/sys/devices/system/node/"
-        nodes = [node for node in os.listdir(node_dir) if node.startswith("node")]
-        return len(nodes)
+def get_free_cores(n: int, max_retry: int = 60) -> Tuple[int, int, int]:
+    '''get contiguous free N cores that numactl can bind to, return (numa_node, start_core, end_core)'''
+    def get_numa_count() -> int:
+        '''get numa node count'''
+        node_dir = pathlib.Path("/sys/devices/system/node/")
+        return len(list(node_dir.glob("node*")))
 
-    def get_unset_cores(cpu_count=None, core_usage=None) -> list[int]:
-        # FIXME: SMT is not considered temporaryly
-        if cpu_count is None:
-            cpu_count = psutil.cpu_count(logical=False)
-        if core_usage is None:
-            core_usage = psutil.cpu_percent(interval=0.5, percpu=True)
+    def get_cpu_usage() -> List[float]:
+        '''get cpu usage of all cores'''
+        return psutil.cpu_percent(interval=0.5, percpu=True)
 
-        cpu_affinity_count = {i: 0 for i in range(cpu_count)}
+    def get_physical_cores() -> Set[int]:
+        '''get all physical cores'''
+        count = psutil.cpu_count(logical=False)
+        if count is None:
+            raise RuntimeError("Failed to get physical core count")
+        return set(range(count))
+
+    def get_usable_cores() -> Set[int]:
+        '''get all cores current process can bind to'''
+        return os.sched_getaffinity(0)
+
+    def get_bound_cores() -> Set[int]:
+        '''get all cores that are already bound by other processes'''
         valid_list = ["running", "disk-sleep", "waking", "waiting"]
+        cores = set()
         for proc in psutil.process_iter(["pid", "name", "cpu_affinity", "status"]):
             try:
-                affinity = proc.info["cpu_affinity"]
-                valid = proc.info["status"] in valid_list
-                if affinity and max(affinity) < cpu_count and len(affinity) > 1 and valid:
-                    for cpu in affinity:
-                        cpu_affinity_count[cpu] += 1
+                # our script usually bind <= 16 cores for verilator, only consider these processes, so skip if len > 16
+                if not proc.info["status"] in valid_list or len(proc.info["cpu_affinity"]) > 16:
+                    continue
+                cores |= set(proc.info["cpu_affinity"])
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                 pass
 
-        unset_cores = [cpu for cpu, count in cpu_affinity_count.items() if count == 0]
-        return unset_cores
+        return cores
 
-    def detect(n):
-        percpu_use_thres = 30
+    def detect(n: int) -> Tuple[bool, int, int, int]:
+        numa_count = get_numa_count()
+        phy_cores = get_physical_cores() # invariant, get once
+        num_core = len(phy_cores)
+        num_window = num_core // n
 
-        # SMT is not allowed
-        num_core = psutil.cpu_count(logical=False)
-        num_window = max(num_core // n - 1, 0)
-        numa_node = numa_count()  # default 2
+        def check(i) -> bool:
+            window = range(i * n, i * n + n)
+            # may change during execution (other processes may taskset this process), get in loop
+            candidates = phy_cores & get_usable_cores()
+            if not set(window).issubset(candidates): # fail-fast
+                return False
 
-        def check(i):
-            core_usage = psutil.cpu_percent(interval=0.5, percpu=True)
-            unset_cores = get_unset_cores(num_core, core_usage)
+            # then get unused cores in phy_cores & usable_cores
+            candidates -= get_bound_cores()
+            if not set(window).issubset(candidates): # fail-fast
+                return False
 
-            window_cores = range(i * n, i * n + n)
+            core_usage = get_cpu_usage()
             window_usage = core_usage[i * n : i * n + n]
 
-            # average usage of window_cores less than percpu_use_thres
-            cond1 = sum(window_usage) < percpu_use_thres * n
-            # less than 1 core has high usage in window_cores
-            cond2 = (
+            return (
+                # average usage of window_cores less than percpu_use_thres
+                sum(window_usage) < 30 * n and
+                # less than 1 core has high usage in window_cores
                 sum(map(lambda x: x > 80, window_usage)) < 1
             )
-            # window_cores is unset
-            cond3 = set(window_cores).issubset(unset_cores)
-            return cond1 and cond2 and cond3
 
         for i in random.sample(range(num_window), num_window):
             if not check(i):
                 continue
 
             # sleep random time to avoid contention, then re-check
-            time.sleep(random.uniform(1, 30))
+            time.sleep(random.uniform(0, 10))
             if not check(i):
                 continue
 
             # return (Success?, memory node, start_core, end_core)
             return (
                 True,
-                (int)(((i * n) % num_core) // (num_core // numa_node)),
+                (int)(((i * n) % num_core) // (num_core // numa_count)),
                 (int)(i * n),
                 (int)(i * n + n - 1),
-                num_core,
             )
 
-        return (False, 0, 0, 0, num_core)
-    
-    while True:
-        success, node, start_core, end_core, num_core = detect(n)
+        return (False, 0, 0, 0)
+
+    for _ in range(max_retry):
+        success, node, start_core, end_core = detect(n)
         if success:
             print(f"Found free cores: {start_core}-{end_core} on NUMA node {node}")
             return (node, start_core, end_core)
-        else:
-            print("No free cores found, retrying...")
-            time.sleep(60)
+        print("No free cores found, retry after 60 seconds...")
+        time.sleep(60)
 
+    raise RuntimeError(f"Failed to find {n} free cores after {max_retry} retries")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Python wrapper for XiangShan')
@@ -785,7 +811,11 @@ if __name__ == "__main__":
     parser.add_argument('--generate', action='store_true', help='generate XS verilog')
     parser.add_argument('--vcs-gen', action='store_true', help='generate XS sim verilog for vcs')
     parser.add_argument('--vcs-build', action='store_true', help='build XS simv')
-    parser.add_argument('--ci', nargs='?', type=str, const="", help='run CI tests')
+    parser.add_argument('--ci', nargs='?', type=str, const="", help='run CI tests (isa-smoke selects ISA tests)')
+    parser.add_argument('--isa-smoke-runlist', default='/nfs/home/share/ci-workloads/isa-smoke-tests/runlist.json',
+                        help='path to the ISA smoke test runlist')
+    parser.add_argument('--isa-smoke-extension', type=str,
+                        help='run only the named ISA smoke extension (all enabled extensions by default)')
     parser.add_argument('--ci-vcs', nargs='?', type=str, const="", help='run CI tests on simv')
     parser.add_argument('--clean', action='store_true', help='clean up XiangShan CI workspace')
     parser.add_argument('--timeout', nargs='?', type=int, default=None, help='timeout (in seconds)')
@@ -793,7 +823,6 @@ if __name__ == "__main__":
     parser.add_argument('--nemu', nargs='?', type=str, help='path to nemu')
     parser.add_argument('--am', nargs='?', type=str, help='path to nexus-am')
     parser.add_argument('--dramsim3', nargs='?', type=str, help='path to dramsim3')
-    parser.add_argument('--rvtest', nargs='?', type=str, help='path to riscv-tests')
     parser.add_argument('--wave-dump', nargs='?', type=str , help='path to dump wave')
     # chisel arguments
     parser.add_argument('--enable-log', action='store_true', help='enable log')
@@ -813,9 +842,11 @@ if __name__ == "__main__":
     parser.add_argument('--emu-optimize', nargs='?', type=str, help='verilator optimization letter')
     parser.add_argument('--xprop', action='store_true', help='enable xprop for vcs')
     parser.add_argument('--issue', nargs='?', type=str, help='CHI issue')
+    parser.add_argument('--llc', nargs='?', type=str, help='LLC backend (OpenLLC or ZhuJiang)')
     parser.add_argument('--simfrontend', action='store_true', help='enable the simfrontend')
     # emu arguments
     parser.add_argument('--numa', action='store_true', help='use numactl')
+    parser.add_argument('--numa-max-retry', type=int, default=60, help='max retry to find free numa cores')
     parser.add_argument('--diff', nargs='?', default="./ready-to-run/riscv64-nemu-interpreter-so", type=str, help='nemu so')
     parser.add_argument('--max-instr', nargs='?', type=int, help='max instr')
     parser.add_argument('--disable-fork', action='store_true', help='disable lightSSS')

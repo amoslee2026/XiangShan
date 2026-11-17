@@ -23,7 +23,7 @@ import top.{ArgParser, Generator}
 import utility._
 import xiangshan._
 import xiangshan.ExceptionNO._
-import xiangshan.backend.Bundles.{ExuInput, ExuOutput, MemWakeUpBundle, MemWriteBack, UopIdx, connectSamePort}
+import xiangshan.backend.Bundles.{ExuInput, ExuOutput, MemWakeUpBundle, MemWriteBack, NewExuOutput, UopIdx, connectSamePort}
 import xiangshan.backend.fu.PMPRespBundle
 import xiangshan.backend.fu.FuConfig._
 import xiangshan.backend.fu.fpu.FPU
@@ -31,6 +31,8 @@ import xiangshan.backend.ctrlblock.{DebugLsInfoBundle, LsTopdownInfo}
 import xiangshan.backend.fu.NewCSR._
 import xiangshan.backend.exu.ExeUnitParams
 import xiangshan.backend.rob.RobPtr
+import xiangshan.backend.vector.VecIssueQueue
+import xiangshan.backend.vector.VecIssueQueue.BypassDelay
 import xiangshan.mem.Bundles._
 import xiangshan.mem.LoadReplayCauses._
 import xiangshan.mem.LoadStage._
@@ -54,8 +56,7 @@ class LoadUnitS0(param: ExeUnitParams)(
     val fastReplayCanAccept = Output(Bool())
     // TODO: canAcceptHigh/LowConfPrefetch
     val prefetchReq = Flipped(DecoupledIO(new L1PrefetchReq))
-    val vecldin = Flipped(DecoupledIO(new VectorLoadIn))
-    val ldin = Flipped(DecoupledIO(new ExuInput(param, hasCopySrc = true)))
+    val ldin = Flipped(DecoupledIO(new ExuInput(param)))
 
     // Tlb request
     val tlbReq = DecoupledIO(new TlbReq)
@@ -96,16 +97,14 @@ class LoadUnitS0(param: ExeUnitParams)(
     * 2. fast replay from s3
     * 3. low-priority replay from LRQ
     * 4. high-confidence prefetch
-    * 5. vector elements splited by VSplit
-    * 6. loads issued from IQ
-    * 7. low-confidence prefetch
+    * 5. loads issued from IQ
+    * 6. low-confidence prefetch
     */
   val unalignTail,
     replayHiPrio,
     fastReplay,
     replayLoPrio,
     prefetchHiConf,
-    vectorIssue,
     scalarIssue,
     prefetchLoConf = Wire(DecoupledIO(new LoadStageIO))
 
@@ -115,7 +114,6 @@ class LoadUnitS0(param: ExeUnitParams)(
     fastReplay,
     replayLoPrio,
     prefetchHiConf,
-    vectorIssue,
     scalarIssue,
     prefetchLoConf
   )
@@ -131,6 +129,7 @@ class LoadUnitS0(param: ExeUnitParams)(
   replay.noQuery.get := io.replay.bits.uncacheReplay.get
   replay.DontCarePAddr()
   replay.DontCareUnalign() // assign later in sink
+  replay.lrqAmbReplay.get := io.replay.bits.cause.get(C_MA)
   val replayIsHiPrio = io.replay.bits.isReplayHiPrioEntrance()
   replayHiPrio.valid := io.replay.valid && replayIsHiPrio
   replayHiPrio.bits := replay
@@ -143,11 +142,11 @@ class LoadUnitS0(param: ExeUnitParams)(
   fastReplay.bits.noQuery.get := true.B
   fastReplay.bits.entrance := io.fastReplay.bits.entrance | LoadEntrance.fastReplay.U
   fastReplay.bits.DontCareUnalign() // assign later in sink
+  fastReplay.bits.lrqAmbReplay.get := false.B
   fastReplay.bits.occupySource := VecInit(sources.map(_.valid)).asUInt // for perf
 
   // 3. low-priority replay from LRQ
-  val replayStall = io.ldin.valid && isAfter(io.replay.bits.uop.lqIdx, io.ldin.bits.lqIdx.get) ||
-    io.vecldin.valid && isAfter(io.replay.bits.uop.lqIdx, io.vecldin.bits.uop.lqIdx)
+  val replayStall = io.ldin.valid && isAfter(io.replay.bits.uop.lqIdx, io.ldin.bits.lqIdx.get)
   val replayIsLoPrio = !io.replay.bits.isReplayHiPrioEntrance() && !replayStall
   replayLoPrio.valid := io.replay.valid && replayIsLoPrio
   replayLoPrio.bits := replay
@@ -178,19 +177,6 @@ class LoadUnitS0(param: ExeUnitParams)(
   prefetchHiConf.bits := prefetch
   prefetchHiConf.bits.entrance := LoadEntrance.prefetchHiConf.U
 
-  // 5. vector elements splited by VSplit
-  vectorIssue.valid := io.vecldin.valid
-  connectSamePort(vectorIssue.bits, io.vecldin.bits)
-  vectorIssue.bits.entrance := LoadEntrance.vectorIssue.U
-  vectorIssue.bits.accessType.instrType := InstrType.vector.U
-  vectorIssue.bits.accessType.pftType := DontCare
-  vectorIssue.bits.accessType.pftCoh := DontCare
-  vectorIssue.bits.DontCarePAddr()
-  vectorIssue.bits.noQuery.get := false.B
-  vectorIssue.bits.DontCareUnalign() // assign later in sink
-  vectorIssue.bits.DontCareReplayFromLRQFields()
-  vectorIssue.bits.occupySource := VecInit(sources.map(_.valid)).asUInt // for perf
-
   // 6. loads issued from IQ
   val ldin = io.ldin.bits
   val ldinVAddr = ldin.src(0) + SignExt(ldin.imm(11, 0), VAddrBits)
@@ -217,7 +203,7 @@ class LoadUnitS0(param: ExeUnitParams)(
   scalarIssue.bits.vaddr := ldinVAddr
   scalarIssue.bits.fullva := ldinFullva
   scalarIssue.bits.size := ldinSize
-  scalarIssue.bits.mask := Mux(LSUOpType.isPrefetch(ldin.fuOpType), 0.U, genVWmask(ldinVAddr, ldinSize))
+  scalarIssue.bits.mask := Mux(LSUOpType.isPrefetch(ldin.fuOpType), 0.U, genVWmask128(ldinVAddr, ldinSize))
   scalarIssue.bits.DontCarePAddr()
   scalarIssue.bits.noQuery.get := ldin.fuOpType === LSUOpType.prefetch_i // swInstr
   scalarIssue.bits.DontCareUnalign() // assign later in sink
@@ -257,7 +243,7 @@ class LoadUnitS0(param: ExeUnitParams)(
     * only need to ensure that `req.valid` is HIGH in all cases requiring TLB translation. Meanwhile the strict signal
     * over whether addr translation is actually performed is controled by `noQuery`.
     */
-  val needTlbTransSources = Seq(unalignTail, replayHiPrio, replayLoPrio, vectorIssue, scalarIssue)
+  val needTlbTransSources = Seq(unalignTail, replayHiPrio, replayLoPrio, scalarIssue)
   val tlbReqValid = Cat(needTlbTransSources.map(_.valid)).orR && io.dcacheReq.ready
   val tlbFuOpType = ParallelPriorityMux(needTlbTransSources.map(s => (s.valid -> s.bits.uop.fuOpType)))
   val tlbVAddr = ParallelPriorityMux(needTlbTransSources.map(s => (s.valid -> s.bits.vaddr)))
@@ -267,7 +253,7 @@ class LoadUnitS0(param: ExeUnitParams)(
 
   val noQuery = sink.bits.noQuery.get
 
-  val firstIssueSources = Seq(vectorIssue, scalarIssue)
+  val firstIssueSources = Seq(scalarIssue)
   val firstIssue = Cat(firstIssueSources.map(_.fire)).orR
   val tlbCheckFullva = firstIssue
 
@@ -290,7 +276,7 @@ class LoadUnitS0(param: ExeUnitParams)(
     *   requiring splitting into 2 operations on DCache.
     * - **misalign** is used specifically to denote misalign exception.
     */
-  val needAlignCheckSources = Seq(replayHiPrio, fastReplay, replayLoPrio, vectorIssue, scalarIssue)
+  val needAlignCheckSources = Seq(replayHiPrio, fastReplay, replayLoPrio, scalarIssue)
   val needAlignCheckValids = needAlignCheckSources.map(_.valid)
   val alwaysUnalignSources = Seq(unalignTail)
   val alwaysUnalign = Cat(alwaysUnalignSources.map(_.fire)).orR
@@ -316,22 +302,16 @@ class LoadUnitS0(param: ExeUnitParams)(
     require(bankOffset.getWidth == DCacheVWordOffset)
     require(size.getWidth == MemorySize.Size.width)
     // 1.1 Align check
-    val align = LookupTree(size, List( // TODO: parameterize this
-      "b00".U -> true.B,
-      "b01".U -> (bankOffset.take(1) === 0.U),
-      "b10".U -> (bankOffset.take(2) === 0.U),
-      "b11".U -> (bankOffset.take(3) === 0.U)
+    val align = LookupTree(size, List(
+      MemorySize.B.bitpat -> true.B,
+      MemorySize.H.bitpat -> (bankOffset.take(1) === 0.U),
+      MemorySize.W.bitpat -> (bankOffset.take(2) === 0.U),
+      MemorySize.D.bitpat -> (bankOffset.take(3) === 0.U),
+      MemorySize.Q.bitpat -> (bankOffset.take(4) === 0.U),
     ))
-    assert(size =/= MemorySize.Q.U || bankOffset === 0.U || !valid)
     // 1.2 Bank bound check
     // 1.3 Word bound check
-    val upBoundBankOffset = LookupTree(size, List(
-      MemorySize.B.U -> 0.U,
-      MemorySize.H.U -> 1.U,
-      MemorySize.W.U -> 3.U,
-      MemorySize.D.U -> 7.U,
-      MemorySize.Q.U -> 15.U
-    )) +& bankOffset
+    val upBoundBankOffset = MemorySize.ByteOffset(size) +& bankOffset
     val wordIdx = bankOffset(DCacheWordOffset)
     val upBoundWordIdx = upBoundBankOffset(DCacheWordOffset)
     val crossBank = upBoundBankOffset.head(1).asBool
@@ -365,7 +345,7 @@ class LoadUnitS0(param: ExeUnitParams)(
   storeForwardReq.loadWaitStrict := uop.loadWaitStrict
   storeForwardReq.ssid := uop.ssid
   storeForwardReq.storeSetHit := uop.storeSetHit
-  storeForwardReq.waitForRobIdx := uop.waitForRobIdx
+  storeForwardReq.waitSqIdx := uop.waitSqIdx
 
   if(debugEn) {
     storeForwardReq.debug_robIdx.get := uop.robIdx
@@ -419,7 +399,6 @@ class LoadUnitS0(param: ExeUnitParams)(
   io.replay.ready := replayIsHiPrio && replayHiPrio.ready || replayIsLoPrio && replayLoPrio.ready
   io.fastReplay.ready := fastReplay.ready
   io.prefetchReq.ready := Mux(prefetchIsHiConf, prefetchHiConf.ready, prefetchLoConf.ready)
-  io.vecldin.ready := vectorIssue.ready
   io.ldin.ready := scalarIssue.ready
 
   io.tlbReq.valid := tlbReqValid
@@ -437,6 +416,8 @@ class LoadUnitS0(param: ExeUnitParams)(
   io.tlbReq.bits.isPrefetch := isPrefetch
   io.tlbReq.bits.no_translate := noQuery
   io.tlbReq.bits.pmp_addr := DontCare // TODO: move this outside of TlbReq
+  // TODO: Should be fixed later; see https://github.com/OpenXiangShan/XiangShan/pull/5610
+  io.tlbReq.bits.frm_mabuf := false.B
   io.tlbReq.bits.debug.pc := uop.pc
   io.tlbReq.bits.debug.robIdx := uop.robIdx
   io.tlbReq.bits.debug.isFirstIssue := firstIssue
@@ -482,8 +463,8 @@ class LoadUnitS0(param: ExeUnitParams)(
   XSPerfAccumulate("ldin_valid", io.ldin.valid)
   XSPerfAccumulate("ldin_block", io.ldin.valid && !io.ldin.ready)
   XSPerfAccumulate("ldin_fire_first_issue", io.ldin.fire && firstIssue)
-  XSPerfAccumulate("vecldin_valid", io.vecldin.valid)
-  XSPerfAccumulate("vecldin_block", io.vecldin.valid && !io.vecldin.ready)
+  XSPerfAccumulate("vecldin_valid", false.B) // Todo: vector perf
+  XSPerfAccumulate("vecldin_block", false.B)
   XSPerfAccumulate("first_issue", firstIssue)
   XSPerfAccumulate("replay_fire", io.replay.fire)
   XSPerfAccumulate("replay_fire_vector", io.replay.fire && io.replay.bits.accessType.isVector())
@@ -491,9 +472,11 @@ class LoadUnitS0(param: ExeUnitParams)(
   XSPerfAccumulate("fast_replay_fire_vector", io.fastReplay.fire && io.fastReplay.bits.accessType.isVector())
   XSPerfAccumulate("stall_out", sink.valid && !sink.ready)
   XSPerfAccumulate("stall_dcache", sink.valid && !io.dcacheReq.ready)
-  XSPerfAccumulate("vector_addr_vlen_align", io.vecldin.fire && io.vecldin.bits.bankOffset() === 0.U)
-  XSPerfAccumulate("vector_addr_vlen_unalign", io.vecldin.fire && io.vecldin.bits.bankOffset() =/= 0.U)
+  XSPerfAccumulate("vector_addr_vlen_align", false.B)
+  XSPerfAccumulate("vector_addr_vlen_unalign", false.B)
   XSPerfAccumulate("forward_tld_channel", io.replay.fire && io.replay.bits.forwardDChannel.get)
+  val loadFromLrqAmbReplay = io.replay.fire && io.replay.bits.cause.get(C_MA)
+  XSPerfAccumulate("load_from_lrq_amb_replay", loadFromLrqAmbReplay)
   XSPerfAccumulate("hardware_prefetch_fire", io.prefetchReq.fire)
   XSPerfAccumulate("software_prefetch_fire", io.ldin.fire && LSUOpType.isPrefetch(io.ldin.bits.fuOpType))
   XSPerfAccumulate("hardware_prefetch_block", io.prefetchReq.valid && !io.prefetchReq.ready)
@@ -522,6 +505,8 @@ class LoadUnitS1(param: ExeUnitParams)(
   val io = IO(new Bundle() {
     val redirect = Flipped(ValidIO(new Redirect))
     val kill = Input(Bool())
+    val specialMode = Input(Bool())
+    val robHeadPtr = Input(new RobPtr)
 
     // Tlb response
     val tlbResp = Flipped(DecoupledIO(new TlbResp(2))) // TODO: parameterize 2
@@ -561,7 +546,7 @@ class LoadUnitS1(param: ExeUnitParams)(
     val prefetchTrainHint = Output(Bool())
 
     // Software instruction prefetch
-    val swInstrPrefetch = ValidIO(new SoftIfetchPrefetchBundle)
+    val swInstrPrefetch = ValidIO(new SoftIPrefetchBundle)
 
     // Load trigger
     val csrTrigger = Input(new CsrTriggerBundle)
@@ -593,7 +578,7 @@ class LoadUnitS1(param: ExeUnitParams)(
 
   // storeset
   val isStoreSetHit = uop.storeSetHit
-  val waitRobIdx = uop.waitForRobIdx
+  val waitSqIdx = uop.waitSqIdx
 
   /**
     * Redirect
@@ -609,7 +594,7 @@ class LoadUnitS1(param: ExeUnitParams)(
 
   val isUnalignTail = LoadEntrance.isUnalignTail(entrance)
 
-  val kill = !pipeIn.valid || io.kill || isSwInstrPrefetch ||
+  val kill = !pipeIn.valid || io.kill ||
              robIdx.needFlush(redirect) || robIdx.needFlush(redirectNext) ||
              (robIdx.needFlush(redirectNextNext) && isUnalignTail)
 
@@ -620,6 +605,7 @@ class LoadUnitS1(param: ExeUnitParams)(
   val noQuery = in.noQuery.get
   val tlbHit = tlbResp.valid && !tlbResp.bits.miss && !noQuery
   val tlbMiss = tlbResp.valid && tlbResp.bits.miss
+  val specialRequest = io.specialMode && robIdx =/= io.robHeadPtr
   val paddrEffective = tlbHit || noQuery // hit or noQuery
   val pbmt = Mux(tlbHit, tlbResp.bits.pbmt.head, Pbmt.pma)
   val noQueryPAddr = Mux(io.uncacheBypassResp.valid, io.uncacheBypassResp.bits.paddr, in.paddr.get)
@@ -633,7 +619,7 @@ class LoadUnitS1(param: ExeUnitParams)(
   val gpf = tlbHit && tlbResp.bits.excp.head.gpf.ld
   val tlbException = pf || af || gpf
 
-  val killDCache = kill || tlbMiss || tlbException
+  val killDCache = kill || tlbMiss || tlbException || specialRequest
 
   assert(!(pipeIn.valid && !tlbResp.valid && !noQuery))
 
@@ -673,8 +659,8 @@ class LoadUnitS1(param: ExeUnitParams)(
   unalignTail.entrance := LoadEntrance.unalignTail.U
   unalignTail.vaddr := ((vaddr >> DCacheVWordOffset) + 1.U) << DCacheVWordOffset
   unalignTail.fullva := ((in.fullva >> DCacheVWordOffset) + 1.U) << DCacheVWordOffset
-  unalignTail.size := MemorySize.Q.U
-  unalignTail.mask := genVWmask(vaddr, LSUOpType.size(fuOpType)) >> DCacheVWordBytes
+  unalignTail.size := MemorySize.QB.U
+  unalignTail.mask := genVWmask128(vaddr, LSUOpType.size(fuOpType)) >> DCacheVWordBytes
   unalignTail.align.get := false.B
   unalignTail.unalignHead.get := false.B
   unalignTail.readWholeBank.get := true.B
@@ -690,14 +676,14 @@ class LoadUnitS1(param: ExeUnitParams)(
   val nukeQueryValids = io.staNukeQueryReq.map(_.valid)
   val nukeQueryReqs = io.staNukeQueryReq.map(_.bits)
   val nukePAddrMatches = nukeQueryReqs.map(req => nukePAddrMatch(req.paddr, req.matchType, paddr))
-  val nukeStoreOlders = nukeQueryReqs.map(req => isAfter(robIdx, req.robIdx))
+  val nukeStoreOlders = nukeQueryReqs.map(req => robIdx.isAfterSlot(req.robIdx))
   val nukeMaskMatches = nukeQueryReqs.map(req => (req.mask & in.mask).orR)
   val nuke = Cat((nukeQueryValids lazyZip nukePAddrMatches lazyZip nukeStoreOlders lazyZip nukeMaskMatches).map {
     case (valid, paddrMatch, storeOlder, maskMatch) => valid && paddrMatch && storeOlder && maskMatch
   }).orR && paddrEffective
   // if nuke is storeSetHit store, let load fast replay
   val fastReplayNukeFirst = isStoreSetHit && nukeQueryReqs.zip(nukeQueryValids).map{case (req, v) =>
-    req.robIdx === waitRobIdx && v}.reduce(_ || _)
+    req.sqIdx === waitSqIdx && v}.reduce(_ || _)
 
   /**
     * Pipeline connect
@@ -710,8 +696,9 @@ class LoadUnitS1(param: ExeUnitParams)(
 
   // exception
   val exception = tlbException || bp
-  val stageInfo = Wire(pipeOut.bits.cloneType)
+  val stageInfo = Wire(chiselTypeOf(pipeOut.bits))
   connectSamePort(stageInfo, in)
+  stageInfo.specialModeRequest := specialRequest
   stageInfo.uop.trigger := triggerAction
   stageInfo.uop.exceptionVec(breakPoint) := bp
   stageInfo.uop.exceptionVec(loadPageFault) := pf
@@ -754,7 +741,7 @@ class LoadUnitS1(param: ExeUnitParams)(
   io_pipeIn.get.ready := !pipeOutValid || kill || pipeOut.ready
 
   io.tlbResp.ready := true.B
-  io.tlbReqKill := kill
+  io.tlbReqKill := kill || specialRequest
   io.tlbPAddr := noQueryPAddr
 
   io.dcachePAddr := paddrDCache
@@ -781,7 +768,7 @@ class LoadUnitS1(param: ExeUnitParams)(
   io.unalignTail.valid := unalignTailInjectValid
   io.unalignTail.bits := unalignTail
 
-  io.prefetchTrainHint := pipeIn.valid && !kill && in.isFirstIssue()
+  io.prefetchTrainHint := pipeIn.valid && !kill && in.isFirstIssue() && !isSwInstrPrefetch
 
   io.swInstrPrefetch.valid := pipeIn.valid && isSwInstrPrefetch
   io.swInstrPrefetch.bits.vaddr := vaddr
@@ -823,6 +810,8 @@ class LoadUnitS2(param: ExeUnitParams)(
   val io = IO(new Bundle() {
     val redirect = Flipped(ValidIO(new Redirect))
     val kill = Input(Bool())
+    val specialMode = Input(Bool())
+    val robHeadPtr = Input(new RobPtr)
     val unalignTailValid = Output(Bool())
 
     // PMP result
@@ -854,6 +843,8 @@ class LoadUnitS2(param: ExeUnitParams)(
     val tldForwardResp = Flipped(ValidIO(new DCacheForwardResp))
 
     val uncacheBypassResp = Flipped(ValidIO(new UncacheBypassRespS2))
+
+    val stdDataWrite = Input(new StdDataWriteWindow(StdCnt))
 
     // Nuke query from StoreUnit
     val staNukeQueryReq = Flipped(Vec(StorePipelineWidth, ValidIO(new StoreNukeQueryReq)))
@@ -903,7 +894,7 @@ class LoadUnitS2(param: ExeUnitParams)(
   val isUnalignTail = LoadEntrance.isUnalignTail(entrance)
   val isUnalign = isUnalignHead || isUnalignTail
   val isStoreSetHit = uop.storeSetHit
-  val waitRobIdx = uop.waitForRobIdx
+  val waitSqIdx = uop.waitSqIdx
 
   /**
     * Redirect
@@ -918,7 +909,7 @@ class LoadUnitS2(param: ExeUnitParams)(
     */
   val redirect = io.redirect
   val kill = io.kill || robIdx.needFlush(redirect)
-  val endPipe = isHwPrefetch
+  val endPipe = isPrefetch
 
   /**
     * PMP result & exception handling
@@ -933,7 +924,7 @@ class LoadUnitS2(param: ExeUnitParams)(
     uop.exceptionVec(loadPageFault) ||
     uop.exceptionVec(loadGuestPageFault)
   val tlbAccessable = !tlbUnaccessable
-  val pmpUnaccessable = pmp.ld && tlbHit
+  val pmpUnaccessable = (pmp.ld || pmp.instr && LSUOpType.isHlvx(uop.fuOpType)) && tlbHit
 
   val isNC = tlbHit && tlbAccessable && Pbmt.isNC(pbmt)
   val isMMIO = tlbHit && tlbAccessable && (Pbmt.isIO(pbmt) || Pbmt.isPMA(pbmt) && pmp.mmio)
@@ -944,7 +935,7 @@ class LoadUnitS2(param: ExeUnitParams)(
   val afUnaccessable = uop.exceptionVec(loadAccessFault) || pmpUnaccessable
   val afVectorUncache = accessType.isVector() && isUncache
   val afUnalignMMIO = !in.align.get && isMMIO
-  val afTagError = io.dcacheResp.bits.tag_error && tlbHit && io.csrCtrl.cache_error_enable
+  val afTagError = io.dcacheResp.bits.tag_error && tlbHit && io.csrCtrl.cacheErrorEnable
   val afForwardDenied = Wire(Bool())
   val afBypassDenied = Wire(Bool())
   val af = afUnaccessable || afVectorUncache || afUnalignMMIO || afTagError || afForwardDenied || afBypassDenied
@@ -980,6 +971,27 @@ class LoadUnitS2(param: ExeUnitParams)(
 
   val forwardInvalid = io.sqForwardResp.valid && io.sqForwardResp.bits.forwardInvalid
 
+  val requestedMask = in.mask
+  val sqForwardMask = Mux(
+    io.sqForwardResp.valid,
+    io.sqForwardResp.bits.forwardMask.asUInt,
+    0.U((VLEN / 8).W)
+  )
+  val sbufferForwardMask = Mux(
+    io.sbufferForwardResp.valid,
+    io.sbufferForwardResp.bits.forwardMask.asUInt,
+    0.U((VLEN / 8).W)
+  )
+  val sqSbufferMatchInvalid = io.sqForwardResp.valid && io.sqForwardResp.bits.matchInvalid ||
+    io.sbufferForwardResp.valid && io.sbufferForwardResp.bits.matchInvalid
+  val sqSbufferForwardValid = !sqDataInvalid && !forwardInvalid && !sqSbufferMatchInvalid
+  val sqRequestedForwardedMask = requestedMask & sqForwardMask
+  val sbufferRequestedForwardedMask = requestedMask & sbufferForwardMask
+  val sqSbufferForwardedMask = sqRequestedForwardedMask | sbufferRequestedForwardedMask
+  val sqForwarded = sqRequestedForwardedMask.orR
+  val sqSbufferForwarded = sqSbufferForwardValid && sqForwarded
+  val sqSbufferFullForwarded = sqSbufferForwarded && sqSbufferForwardedMask === requestedMask
+
   // MSHR / TileLink-D channel
   val mshrForwardDenied = io.mshrForwardResp.valid && io.mshrForwardResp.bits.denied
   val tldForwardDenied = io.tldForwardResp.valid && io.tldForwardResp.bits.denied
@@ -994,6 +1006,7 @@ class LoadUnitS2(param: ExeUnitParams)(
   val storeFullForward = (~storeForwardMask & in.mask) === 0.U && !sqDataInvalid
   val fullForward = storeFullForward || dcacheFullForward
   val needDCacheAccess = !fullForward && !isUncache && !isUncacheReplay
+  val specialRequest = in.specialModeRequest
 
   // Uncache bypass
   afBypassDenied := io.uncacheBypassResp.valid && io.uncacheBypassResp.bits.nderr
@@ -1013,7 +1026,7 @@ class LoadUnitS2(param: ExeUnitParams)(
   val nukeQueryValids = io.staNukeQueryReq.map(_.valid)
   val nukeQueryReqs = io.staNukeQueryReq.map(_.bits)
   val nukePAddrMatches = nukeQueryReqs.map(req => nukePAddrMatch(req.paddr, req.matchType, paddr))
-  val nukeStoreOlders = nukeQueryReqs.map(req => isAfter(robIdx, req.robIdx))
+  val nukeStoreOlders = nukeQueryReqs.map(req => robIdx.isAfterSlot(req.robIdx))
   val nukeMaskMatches = nukeQueryReqs.map(req => (req.mask & in.mask).orR)
   val nuke = Cat((nukeQueryValids lazyZip nukePAddrMatches lazyZip nukeStoreOlders lazyZip nukeMaskMatches).map {
     case (valid, paddrMatch, storeOlder, maskMatch) => valid && paddrMatch && storeOlder && maskMatch
@@ -1021,7 +1034,7 @@ class LoadUnitS2(param: ExeUnitParams)(
   // if nuke is storeSetHit store, let load fast replay
   val prevStageFastReplayNukeFirst = in.fastReplayNukeFirst.get
   val fastReplayNukeFirst = isStoreSetHit && nukeQueryReqs.zip(nukeQueryValids).map{case (req, v) =>
-    req.robIdx === waitRobIdx && v}.reduce(_ || _) || prevStageFastReplayNukeFirst
+    req.sqIdx === waitSqIdx && v}.reduce(_ || _) || prevStageFastReplayNukeFirst
 
   /**
     * Preliminary assessment of the load exit
@@ -1050,14 +1063,24 @@ class LoadUnitS2(param: ExeUnitParams)(
   val troubleMaker = !isPrefetch && !alwaysWriteback
   // 1.3 fast replay
   val cause = Wire(in.cause.get.cloneType)
+  val stdDataWriteCurrentMatch = VecInit(io.stdDataWrite.current.map { write =>
+    write.valid && write.bits === sqDataInvalidSqIdx
+  }).asUInt.orR
+  val stdDataWritePreviousMatch = VecInit(io.stdDataWrite.previous.map { write =>
+    write.valid && write.bits === sqDataInvalidSqIdx
+  }).asUInt.orR
+  val ffStdDataWriteMatch = stdDataWriteCurrentMatch || stdDataWritePreviousMatch
+  val fastReplayForwardFail = cause(C_FF) &&
+    !hasHigherPriorityCauses(cause, C_FF) && ffStdDataWriteMatch
   val fastReplayMSHRNack = cause(C_DR) && !hasHigherPriorityCauses(cause, C_DR)
   val fastReplayBankConflict = cause(C_BC) && !hasHigherPriorityCauses(cause, C_BC)
   // if store pipeline is waiting for store, send this load to fast replay
   val fastReplayNuke = cause(C_NK) &&  // TODO: use C_RAR or C_NK?
     !hasHigherPriorityCauses(VecInit(cause.patch(C_MA, Seq(cause(C_MA) && !fastReplayNukeFirst), 1)), C_RAR)
-  val fastReplay = !LoadEntrance.isFastReplay(entrance) && // 1.3.1
-    (fastReplayMSHRNack || fastReplayBankConflict || fastReplayNuke) && // 1.3.2
-    !isUnalign && !tlbMiss // 1.3.3, if tlb miss, should not to fast replay
+  val fastReplayEligible = !LoadEntrance.isFastReplay(entrance) &&
+    !isUnalign && !tlbMiss && !specialRequest
+  val fastReplay = fastReplayEligible && // 1.3.1, 1.3.3
+    (fastReplayMSHRNack || fastReplayBankConflict || fastReplayNuke || fastReplayForwardFail) // 1.3.2
 
   /**
     * Nuke query to LQRAR / LQRAW
@@ -1065,7 +1088,8 @@ class LoadUnitS2(param: ExeUnitParams)(
     * For timing considerations, violation check requests issued in s2 do not need to be accurate. But MUST ensure that
     * accurate `revoke` signals are given in s3 to withdraw requests that do not require violation check.
     */
-  val nukeQueryReqValid = troubleMaker && !prevStageNuke
+  val canNukeQuery = !isMMIOReplay && !isPrefetch
+  val nukeQueryReqValid = canNukeQuery && !prevStageNuke
   val nukeQueryReq = Wire(new LoadNukeQueryReq)
   nukeQueryReq.robIdx := robIdx
   nukeQueryReq.paddr := paddr
@@ -1086,14 +1110,13 @@ class LoadUnitS2(param: ExeUnitParams)(
   /**
     * Load replay
     */
-  val shouldReplay = cause.asUInt.orR || in.shouldFastReplay.get // including fast replay
   cause(C_UNCACHE) := troubleMaker && Mux(
     isUncacheReplay,
     isNCReplay && (sqDataInvalid || rarNack || rawNack || nuke || forwardInvalid),
     isUncache
   )
   cause(C_MA) := troubleMaker && uop.storeSetHit && sqAddrInvalid
-  cause(C_TM) := troubleMaker && tlbMiss
+  cause(C_TM) := (troubleMaker && tlbMiss || specialRequest)
   cause(C_FF) := troubleMaker && sqDataInvalid
   cause(C_DR) := troubleMaker && needDCacheAccess && mshrNack
   cause(C_DM) := troubleMaker && needDCacheAccess && dcacheMiss
@@ -1104,6 +1127,8 @@ class LoadUnitS2(param: ExeUnitParams)(
   cause(C_NK) := troubleMaker && nuke
   cause(C_MF) := false.B
   cause(C_SMF) := troubleMaker && forwardInvalid
+  val causeOrR = cause.asUInt.orR
+  val shouldReplay = causeOrR || in.shouldFastReplay.get // including fast replay
 
   def hasHigherPriorityCauses(cause: Vec[Bool], index: Int): Bool = {
     if (index == 0) false.B
@@ -1119,8 +1144,8 @@ class LoadUnitS2(param: ExeUnitParams)(
     * 1. `wakeup` should not asserted when exception occurs
     * 2. `wakeup` should not asserted in case of a vaddr / paddr mismatch (debatable yet)
     */
-  val shouldWakeup = !shouldReplay && !isUncache && !exception && !isSwPrefetch
-  val shouldWriteback = shouldWakeup || exception || matchInvalid || isSwPrefetch
+  val shouldWakeup = !shouldReplay && !isUncache && !exception && !isPrefetch
+  val shouldWriteback = shouldWakeup || exception || matchInvalid
 
   /**
     * Pipeline connect
@@ -1131,15 +1156,11 @@ class LoadUnitS2(param: ExeUnitParams)(
   .elsewhen (pipeIn.fire) { pipeOutValid := true.B }
   .elsewhen (pipeOut.fire) { pipeOutValid := false.B }
 
-  val stageInfo = Wire(pipeOut.bits.cloneType)
+  val stageInfo = Wire(chiselTypeOf(pipeOut.bits))
   connectSamePort(stageInfo, in)
   stageInfo.uop.flushPipe := false.B
   stageInfo.uop.exceptionVec extendFrom exceptionVec
-  stageInfo.uop.vpu.vstart := Mux(
-    LoadEntrance.isReplay(entrance) || LoadEntrance.isFastReplay(entrance),
-    uop.vpu.vstart,
-    in.vecVaddrOffset.get >> uop.vpu.veew
-  )
+  // Todo[Vector]: support vector exception
   stageInfo.pmp.get := pmp
   stageInfo.nc.get := isNC
   stageInfo.mmio.get := isMMIO
@@ -1156,14 +1177,18 @@ class LoadUnitS2(param: ExeUnitParams)(
   stageInfo.perfWaitStoreRetired.get := io.sqForwardResp.valid && io.sqForwardResp.bits.perfWaitStoreRetired
   stageInfo.perfIsCmaReplay.get := perfIsCmaReplay
   // Pre-process for s3
+  // A RR candidate is a bank-conflict fast replay only. Keep it off the
+  // general fast-replay cause OR so the S2 candidate-to-arbiter path is
+  // independent of MSHR-nack, nuke, and forward-fail logic.
   val rrBankConflictFastReplay =
-    !kill && fastReplay && fastReplayBankConflict && io.dcacheRRBankConflict && !exception
+    !kill && fastReplayEligible && fastReplayBankConflict && io.dcacheRRBankConflict
   val rrBankConflictFastReplayCandidate = pipeIn.fire && rrBankConflictFastReplay
   io.rrBankConflictFastReplayCandidate := rrBankConflictFastReplayCandidate
   XSError(
     io.rrBankConflictFastReplayGrant && !rrBankConflictFastReplayCandidate,
     "rr bank conflict fast replay grant without candidate in s2"
   )
+  stageInfo.causeOrR.get := causeOrR
   stageInfo.troubleMaker.get := troubleMaker
   stageInfo.rrBankConflictFastReplay.get := rrBankConflictFastReplay
   stageInfo.rrBankConflictFastReplayGrant.get := io.rrBankConflictFastReplayGrant
@@ -1171,6 +1196,9 @@ class LoadUnitS2(param: ExeUnitParams)(
   stageInfo.matchInvalid.get := matchInvalid && troubleMaker
   stageInfo.shouldWakeup.get := shouldWakeup
   stageInfo.shouldWriteback.get := shouldWriteback
+  stageInfo.sqSbufferForwarded.get := sqSbufferForwarded
+  stageInfo.sqSbufferFullForwarded.get := sqSbufferFullForwarded
+  stageInfo.specialModeRequest := specialRequest
 
   when (pipeIn.fire) { pipeOutBits := stageInfo }
 
@@ -1183,7 +1211,8 @@ class LoadUnitS2(param: ExeUnitParams)(
 
   io.unalignTailValid := pipeIn.valid && isUnalignTail
 
-  io.dcacheKill := kill || exception || isUncache || isUncacheReplay
+  io.dcacheKill := kill || exception || isUncache || isUncacheReplay ||
+    specialRequest
   io.dcacheResp.ready := true.B
 
   io.rarNukeQueryReq.valid := nukeQueryReqValid && pipeIn.valid
@@ -1221,8 +1250,11 @@ class LoadUnitS2(param: ExeUnitParams)(
    *  Perf counters
    */
   val fire = pipeIn.fire && !kill
+  val ffFastReplayInitiate = fire && fastReplayForwardFail &&
+    !LoadEntrance.isFastReplay(entrance) && !isUnalign && !tlbMiss && !exception
   XSPerfAccumulate("valid", pipeIn.valid)
   XSPerfAccumulate("fire", fire)
+  XSPerfAccumulate("forward_fail_fast_replay_initiate", ffFastReplayInitiate)
   XSPerfAccumulate("fire_first_issue", fire && in.isFirstIssue())
   XSPerfAccumulate("dcache_miss", fire && io.dcacheResp.bits.miss)
   XSPerfAccumulate("dcache_miss_first_issue", fire && io.dcacheResp.bits.miss && in.isFirstIssue())
@@ -1271,10 +1303,13 @@ class LoadUnitS3(param: ExeUnitParams)(
     // Unalign head from S4
     val unalignConcat = Flipped(ValidIO(new LoadStageIO))
 
+    // Vector wake up
+    val vldS3WakeUp: VecIssueQueue.WakeUpBundle = new VecIssueQueue.WakeUpBundle(backendParams.vpPregParams)
+
     // Writeback to Backend / LQ / VLMergeBuffer
     val ldout = new MemWriteBack(param)
+    val vldout = new NewExuOutput(param)
     val lqWrite = DecoupledIO(new LqWriteBundle)
-    val vecldout = Decoupled(new VecPipelineFeedbackIO(isVStore = false))
 
     // Fast replay
     val fastReplay = DecoupledIO(new FastReplayIO)
@@ -1305,6 +1340,8 @@ class LoadUnitS3(param: ExeUnitParams)(
     val perfLqHeadPtr = Input(new LqPtr)
     val perfLqFull = Input(Bool())
     val perfMdpAddr = Output(new PerfMdpAddr)
+    // ROB-head source execute-fail events
+    val sourceExecuteFailRobHead = Output(LoadEntrance())
 
     // CSR control signals
     val csrCtrl = Flipped(new CustomCSRCtrlIO)
@@ -1335,10 +1372,10 @@ class LoadUnitS3(param: ExeUnitParams)(
   val isUnalignTail = LoadEntrance.isUnalignTail(entrance)
   val troubleMaker = in.troubleMaker.get
   val cause = in.cause.get
-  val shouldReplay = cause.asUInt.orR || in.shouldFastReplay.get
+  val causeOrR = in.causeOrR.get
+  val shouldReplay = causeOrR || in.shouldFastReplay.get
 
-  assert(!pipeIn.valid || !accessType.isHwPrefetch(), "HwPrefetch should be killed in S2")
-  assert(!io.vecldout.valid || io.vecldout.ready, "Writeback to VLMergeBuffer should always be ready")
+  assert(!pipeIn.valid || !accessType.isPrefetch(), "Prefetch should be killed in S2")
 
   /**
     * Redirect
@@ -1369,12 +1406,18 @@ class LoadUnitS3(param: ExeUnitParams)(
   val s4HeadAlwaysWriteback = s4Head.headAlwaysWriteback.get
   val s4HeadWritebackDependOnTail = s4Head.writebackDependOnTail.get
   val s4HeadHasException = s4Head.hasException.get
-  val s4HeadShouldReplay = s4HeadReplayCause.asUInt.orR
+  val s4HeadShouldReplay = s4Head.causeOrR.get
   val s4HeadShouldRARViolation = s4Head.shouldRarViolation.get
   val s4HeadIsReplay = LoadEntrance.isReplay(s4Head.entrance)
   val s4HeadCacheMiss = s4Head.cause.get(C_DM)
   val s4HeadMshrId    = s4Head.mshrId.get
   val s4HeadHandledByMSHR = s4Head.handledByMSHR.get
+
+  val perfOutcomeUop = Mux(s4HeadValid, s4Head.uop, uop)
+  val perfOutcomeHasROBEntry = Mux(s4HeadValid, s4Head.hasROBEntry, in.hasROBEntry)
+  val perfOutcomeKill = io.kill || perfOutcomeUop.robIdx.needFlush(redirect)
+  val perfAtRobHead = pipeIn.valid && !perfOutcomeKill && perfOutcomeHasROBEntry &&
+    perfOutcomeUop.robIdx === io.perfRobHeadPtr
 
   val vaddr = Mux(s4HeadValid, s4HeadVAddr, in.vaddr)
   val paddr = Mux(s4HeadValid, s4HeadPAddr, in.paddr.get)
@@ -1384,7 +1427,7 @@ class LoadUnitS3(param: ExeUnitParams)(
     *
     * Noted that exception can affect control signals for wakeup and writeback
     */
-  val dcacheError = EnableAccurateLoadError.B && io.csrCtrl.cache_error_enable && troubleMaker && io.dcacheError
+  val dcacheError = EnableAccurateLoadError.B && io.csrCtrl.cacheErrorEnable && troubleMaker && io.dcacheError
   val s3ExceptionVec = uop.exceptionVec.selectByFu(LduCfg)
   val s3Exception = s3ExceptionVec.orR || TriggerAction.isDmode(uop.trigger)
   val exceptionVec = ExceptSparseVec.mux2(
@@ -1440,7 +1483,7 @@ class LoadUnitS3(param: ExeUnitParams)(
     * RAR / RAW revoke
     */
   val s3RevokeException = s3Exception
-  val s3RevokeReplay = cause.asUInt.orR
+  val s3RevokeReplay = causeOrR
   val s3Revoke = s3RevokeException || s3RevokeReplay
   val s4HeadRevoke = s4HeadHasException || s4HeadShouldReplay
   val revokeLastCycle = s3Revoke || s4HeadValid && s4HeadRevoke
@@ -1453,7 +1496,7 @@ class LoadUnitS3(param: ExeUnitParams)(
     */
   // RAR violation
   val rarResp = io.rarNukeQueryResp
-  val s3RarViolation = rarResp.valid && rarResp.bits.nuke && io.csrCtrl.ldld_vio_check_enable && !s3Exception
+  val s3RarViolation = rarResp.valid && rarResp.bits.nuke && io.csrCtrl.ldldVioCheckEnable && !s3Exception
   val rarViolation = s3RarViolation || s4HeadValid && s4HeadShouldRARViolation
   // vaddr / paddr mismatch in STLF
   val s3MatchInvalid = in.matchInvalid.get && !s3Exception
@@ -1471,8 +1514,8 @@ class LoadUnitS3(param: ExeUnitParams)(
   /**
     * Writeback to Backend / LQ / VLMergeBuffer
     */
-  // Writeback to Backend
-  val ldoutValid = pipeIn.valid && shouldWriteback && !isVector && endPipe
+  // Writeback to Backend(int/fp)
+  val ldoutValid = pipeIn.valid && shouldWriteback && !uop.vecWen && endPipe
   val ldout = Wire(new MemWriteBack(param))
   ldout.toIntRf.foreach { case port =>
     port.valid := uop.rfWen && pipeIn.valid && endPipe && shouldWakeup
@@ -1499,11 +1542,29 @@ class LoadUnitS3(param: ExeUnitParams)(
   ldout.toRob.bits.debugInfo.perfDebugInfo.foreach(_ := uop.perfDebugInfo)
   ldout.toRob.bits.debugInfo.debug_seqNum.foreach(_ := uop.debug_seqNum)
 
+  // Writeback to backend(vector)
+  val vldoutValid = pipeIn.valid && shouldWriteback && uop.vecWen && endPipe
+  val vldout = Wire(new NewExuOutput(param))
+  vldout := ldout.toNewExuOutputBundle()
+  vldout.toRob.valid := vldoutValid
+  vldout.toVecRf.foreach { case port =>
+    port.valid := uop.vecWen && pipeIn.valid && endPipe && shouldWakeup
+    port.bits := DontCare
+  }
+  vldout.toV0Rf.foreach { case port =>
+    port.valid := uop.v0Wen && pipeIn.valid && endPipe && shouldWakeup
+    port.bits := DontCare
+  }
   // Writeback to LQ
   val lqWriteValid = pipeIn.valid && !doFastReplay && endPipe
   val lqWriteReady = io.lqWrite.ready
-  val lqWriteCause = Mux(s4HeadValid && s4HeadShouldReplay, s4HeadReplayCause, cause)
-  val lqWriteNeedReplay = lqWriteCause.asUInt.orR
+
+  val useS4HeadReplay = s4HeadValid && s4HeadShouldReplay
+  val lqWriteCause = Mux(useS4HeadReplay, s4HeadReplayCause, cause)
+  val lqWriteTlbId = Mux(useS4HeadReplay, s4Head.tlbId.get, in.tlbId.get)
+  val lqWriteTlbFull = Mux(useS4HeadReplay, s4Head.tlbFull.get, in.tlbFull.get)
+
+  val lqWriteNeedReplay = useS4HeadReplay || causeOrR
   val lqWriteCauseOH = PriorityEncoderOH(lqWriteCause)
   val lqWrite = Wire(new LqWriteBundle)
   val lqWriteMshrId = Mux(s4HeadCacheMiss && s4HeadValid, s4HeadMshrId, in.mshrId.get)
@@ -1521,9 +1582,16 @@ class LoadUnitS3(param: ExeUnitParams)(
   lqWrite.memBackTypeMM := !in.pmp.get.mmio
   lqWrite.isHyper := in.tlbException.get.isHyper
   lqWrite.isForVSnonLeafPTE := exceptionIsForVSnonLeafPTE
+  // An S4 request carrying a TLB/cache replay cause can start special-mode counting.
+  lqWrite.specialModeRequest := Mux(useS4HeadReplay, s4Head.specialModeRequest, in.specialModeRequest)
+  lqWrite.specialModeEligible := s4HeadValid && (
+    lqWriteCause(LoadReplayCauses.C_TM) ||
+    lqWriteCause(LoadReplayCauses.C_DR) ||
+    lqWriteCause(LoadReplayCauses.C_DM)
+  )
   lqWrite.isvec := isVector
   lqWrite.isLastElem := DontCare // TODO: remove this
-  lqWrite.is128bit := in.size === MemorySize.Q.U
+  lqWrite.is128bit := MemorySize.sizeIs(_.Q)(in.size)
   lqWrite.uop_unit_stride_fof := DontCare // TODO: remove this
   lqWrite.usSecondInv := DontCare // TODO: remove this
   lqWrite.elemIdx := in.elemIdx.get
@@ -1538,7 +1606,7 @@ class LoadUnitS3(param: ExeUnitParams)(
   lqWrite.replacementUpdated := DontCare // TODO: remove this
   lqWrite.missDbUpdated := DontCare // TODO: remove this
   lqWrite.schedIndex := in.replayQueueIdx.get
-  lqWrite.updateAddrValid := ldoutValid
+  lqWrite.updateAddrValid := ldoutValid || vldoutValid
   lqWrite.rep_info.mshr_id := lqWriteMshrId
   lqWrite.rep_info.full_fwd := false.B
   lqWrite.rep_info.data_inv_sq_idx := in.dataInvalidSqIdx.get
@@ -1548,8 +1616,9 @@ class LoadUnitS3(param: ExeUnitParams)(
   lqWrite.rep_info.need_rep := lqWriteNeedReplay
   lqWrite.rep_info.cause := lqWriteCauseOH
   lqWrite.rep_info.debug := uop.perfDebugInfo
-  lqWrite.rep_info.tlb_id := in.tlbId.get
-  lqWrite.rep_info.tlb_full := in.tlbFull.get
+  lqWrite.rep_info.tlb_id := lqWriteTlbId
+  lqWrite.rep_info.tlb_full := lqWriteTlbFull
+  lqWrite.rep_info.rep_from_unalign_head := useS4HeadReplay
 
   val perfIsReplayExec = LoadEntrance.isReplay(entrance) || s4HeadIsReplay && s4HeadValid
   val perfMdpAddrValid = Mux(s4HeadValid, s4Head.perfMdpAddrValid.get, in.perfMdpAddrValid.get)
@@ -1613,32 +1682,6 @@ class LoadUnitS3(param: ExeUnitParams)(
     reset = reset
   )
 
-  // Writeback to VLMergeBuffer
-  val vecldoutValid = pipeIn.valid && !kill && shouldWriteback && isVector && endPipe
-  val vecldout = Wire(new VecPipelineFeedbackIO(isVStore = false))
-  vecldout.mBIndex := in.mbIndex.get
-  vecldout.hit := !shouldReplay || lqWriteReady
-  vecldout.isvec := isVector
-  vecldout.flushState := DontCare
-  vecldout.sourceType := RSFeedbackType.lrqFull
-  vecldout.trigger := uop.trigger
-  vecldout.nc := false.B
-  vecldout.mmio := false.B
-  vecldout.exceptionVec := exceptionVec
-  vecldout.hasException := exception
-  vecldout.vaddr := exceptionFullva
-  vecldout.vaNeedExt := exceptionVaNeedExt
-  vecldout.gpaddr := exceptionGpaddr
-  vecldout.isForVSnonLeafPTE := exceptionIsForVSnonLeafPTE
-  vecldout.vstart := uop.vpu.vstart
-  vecldout.vecTriggerMask := in.vecTriggerMask.get
-  vecldout.elemIdx := in.elemIdx.get
-  vecldout.mask := in.mask
-  vecldout.alignedType := in.size
-  vecldout.reg_offset.get := in.regOffset.get
-  vecldout.elemIdxInsideVd.get := in.elemIdxInsideVd.get
-  vecldout.vecdata.get := DontCare // assign data from LoadUnitDataPath
-
   /**
     * Exception info
     */
@@ -1686,10 +1729,13 @@ class LoadUnitS3(param: ExeUnitParams)(
   io_pipeIn.get.ready := !pipeOutValid || kill || endPipe || pipeOut.ready
 
   io.ldout := ldout
+  io.vldout := vldout
   io.lqWrite.valid := lqWriteValid
   io.lqWrite.bits := lqWrite
-  io.vecldout.valid := vecldoutValid
-  io.vecldout.bits := vecldout
+
+  io.vldS3WakeUp.wen := vldout.toVecRf.get.valid
+  io.vldS3WakeUp.pdest := vldout.pdest
+  io.vldS3WakeUp.delay := BypassDelay.delay0
 
   io.fastReplay.valid := pipeIn.valid && !kill && shouldFastReplay && allowRRBankConflictFastReplay
   io.fastReplay.bits := fastReplay
@@ -1707,10 +1753,10 @@ class LoadUnitS3(param: ExeUnitParams)(
   io.rollback.bits := DontCare
   io.rollback.bits.isRVC := uop.isRVC
   io.rollback.bits.robIdx := robIdx
+  io.rollback.bits.satpFlush := false.B
   io.rollback.bits.ftqIdx := uop.ftqPtr
   io.rollback.bits.ftqOffset := uop.ftqOffset
   io.rollback.bits.level := rollbackLevel
-  io.rollback.bits.target := uop.pc
   io.rollback.bits.debug_runahead_checkpoint_id := uop.perfDebugInfo.runahead_checkpoint_id
 
   io.exceptionInfo.valid := exceptionInfoValid
@@ -1730,6 +1776,30 @@ class LoadUnitS3(param: ExeUnitParams)(
   /**
     * Perf counters
     */
+  val demandLoad = isScalar || isVector
+  val transactionReplay = shouldReplay || s4HeadValid && s4HeadShouldReplay
+  val loadFromSqSbufferBase = pipeIn.fire && !kill && demandLoad &&
+    !transactionReplay && !exception && !rarViolation && !matchInvalid && in.sqSbufferForwarded.get
+  val loadFromSqSbufferFullData = loadFromSqSbufferBase && in.sqSbufferFullForwarded.get
+  val loadFromSqSbufferPartialData = loadFromSqSbufferBase && !in.sqSbufferFullForwarded.get
+  val loadFromSqSbufferSuccess = loadFromSqSbufferPartialData || loadFromSqSbufferFullData
+  val loadSuccessfulWriteback = (io.ldout.toRob.fire || io.vldout.toRob.valid) && !kill && demandLoad &&
+    !transactionReplay && !exception && !rollbackValid
+  val lrqAmbReplay = Mux(s4HeadValid, s4Head.lrqAmbReplay.get, in.lrqAmbReplay.get)
+  val lrqAmbSqSbufferForwarded = Mux(
+    s4HeadValid,
+    s4Head.sqSbufferForwarded.get || in.sqSbufferForwarded.get,
+    in.sqSbufferForwarded.get
+  )
+  val loadFromLrqAmbForwardSuccess = pipeIn.fire && endPipe && !kill && demandLoad && lrqAmbReplay &&
+    lrqAmbSqSbufferForwarded && !transactionReplay && !exception && !rarViolation && !matchInvalid
+
+  XSPerfAccumulate("load_from_sq_sbuffer_success", loadFromSqSbufferSuccess)
+  XSPerfAccumulate("load_from_sq_sbuffer_partial_data", loadFromSqSbufferPartialData)
+  XSPerfAccumulate("load_from_sq_sbuffer_full_data", loadFromSqSbufferFullData)
+  XSPerfAccumulate("load_successful_writeback", loadSuccessfulWriteback)
+  XSPerfAccumulate("load_from_lrq_amb_forward_success", loadFromLrqAmbForwardSuccess)
+
   XSPerfAccumulate("rollback_total", rollbackValid)
   XSPerfAccumulate("rollback_rar_violation", rollbackValid && rarViolation)
   XSPerfAccumulate("rollback_match_invalid", rollbackValid && matchInvalid)
@@ -1741,6 +1811,15 @@ class LoadUnitS3(param: ExeUnitParams)(
   val executeFail = lqWriteValid && lqWriteCause.asUInt.orR || pipeIn.valid && shouldFastReplay
   // fastReplay's entrance maybe not one-hot.
   val perfEntrance = Mux((pipeIn.bits.entrance & LoadEntrance.fastReplay.U).orR, LoadEntrance.fastReplay.U, pipeIn.bits.entrance)
+
+  val sourceExecuteFailRobHead = Mux(perfAtRobHead && executeFail, perfEntrance, 0.U)
+  io.sourceExecuteFailRobHead := sourceExecuteFailRobHead
+
+  for (i <- 0 until LoadEntrance.num) {
+    val sourceName = LoadEntrance.findNameById(i)
+    XSPerfAccumulate(s"${sourceName}_execute_fail_rob_head", sourceExecuteFailRobHead(i))
+  }
+
   for (i <- 0 until LoadEntrance.num) {
     val highPrioNume = LoadEntrance.findNameById(i)
     for (j <- i + 1 until LoadEntrance.num) {
@@ -1873,7 +1952,7 @@ class LoadUnitDataPath(val param: ExeUnitParams)(implicit p: Parameters) extends
   val s2RdataSelByOffset = VecInit((0 until VLEN / 8).map(i => bankOffset === i.U))
   // If the load is unaligned, its bank offset must reside in (8, 15]
   val unalignHeadBankOffsetUpperBound = VLEN / 8 - 1 // 15
-  val unalignHeadBankOffsetLowerBound = XLEN / 8 // 8
+  val unalignHeadBankOffsetLowerBound = 0
   val s2TailRdataSelByHeadOffset = VecInit(
     (unalignHeadBankOffsetUpperBound until unalignHeadBankOffsetLowerBound by -1).map(i =>
       unalignHeadBankOffset === i.U
@@ -1889,7 +1968,7 @@ class LoadUnitDataPath(val param: ExeUnitParams)(implicit p: Parameters) extends
   val s3TailRdataSelByHeadOffset = RegEnable(s2TailRdataSelByHeadOffset, s2Valid)
   // Data shifting
   val s3ShiftHeadList = (0 until VLEN by 8).map(i => (s3Data >> i))
-  val s3ShiftTailList = (1*8 until XLEN by 8).map(i => (s3Data << i).take(VLEN))
+  val s3ShiftTailList = (1*8 until VLEN by 8).map(i => Cat(s3Data.take(VLEN - i), 0.U(i.W)))
   val s3ShiftHead = Mux1H(s3RdataSelByOffset, s3ShiftHeadList)
   val s3ShiftTail = Mux1H(s3TailRdataSelByHeadOffset, s3ShiftTailList)
   val s4ShiftHead = RegEnable(s3ShiftHead, s3Valid)
@@ -1922,15 +2001,16 @@ class LoadUnitDataPath(val param: ExeUnitParams)(implicit p: Parameters) extends
 class LoadUnitIO(val param: ExeUnitParams)(implicit p: Parameters) extends XSBundle {
   private val numMemChannels = p(XSCoreParamsKey).dcacheParametersOpt.get.numMemChannels
   val redirect = Flipped(ValidIO(new Redirect))
+  val specialMode = Input(Bool())
+  val robHeadPtr = Input(new RobPtr)
   // Request sources
-  val ldin = Flipped(DecoupledIO(new ExuInput(param, hasCopySrc = true)))
-  val vecldin = Flipped(DecoupledIO(new VectorLoadIn))
+  val ldin = Flipped(DecoupledIO(new ExuInput(param)))
   val replay = Flipped(DecoupledIO(new LoadReplayIO))
   val prefetchReq = Flipped(DecoupledIO(new L1PrefetchReq))
   // Writeback to Backend / LQ / VLMergeBuffer
   val ldout = new MemWriteBack(param)
+  val vldout = new NewExuOutput(param)
   val lqWrite = DecoupledIO(new LqWriteBundle)
-  val vecldout = Decoupled(new VecPipelineFeedbackIO(isVStore = false))
   // TLB / PMA / PMP
   val tlb = new TlbRequestIO(2)
   val tlbHint = Flipped(new TlbHintReq)
@@ -1939,6 +2019,8 @@ class LoadUnitIO(val param: ExeUnitParams)(implicit p: Parameters) extends XSBun
   val dcache = new DCacheLoadIO
   // IQ wakeup and load cancel
   val wakeup = ValidIO(new MemWakeUpBundle)
+  // vector load wakeup
+  val vldS3WakeUp = new VecIssueQueue.WakeUpBundle(backendParams.vpPregParams)
   val cancel = Output(Bool())
   val perfRobHeadPtr = Input(new RobPtr)
   val perfLqHeadPtr = Input(new LqPtr)
@@ -1966,13 +2048,16 @@ class LoadUnitIO(val param: ExeUnitParams)(implicit p: Parameters) extends XSBun
   val prefetchTrainHintS2 = Output(Bool())
   val prefetchTrain = ValidIO(new TrainReqBundle)
   // Software instruction prefetch
-  val swInstrPrefetch = ValidIO(new SoftIfetchPrefetchBundle)
+  val swInstrPrefetch = ValidIO(new SoftIPrefetchBundle)
   // CSR control signals and load trigger
   val csrCtrl = Flipped(new CustomCSRCtrlIO)
   val csrTrigger = Input(new CsrTriggerBundle)
   // Debug info and top-down info
   val debugInfo = Output(new DebugLsInfoBundle)
   val topDownInfo = Output(new LsTopdownInfo)
+  // ROB-head source execute-fail events for MemBlock aggregation
+  val sourceExecuteFailRobHead = Output(LoadEntrance())
+  val stdDataWrite = Input(new StdDataWriteWindow(backendParams.StdCnt))
 }
 
 class NewLoadUnit(val param: ExeUnitParams)(implicit p: Parameters) extends XSModule with HasPerfEvents {
@@ -2012,7 +2097,6 @@ class NewLoadUnit(val param: ExeUnitParams)(implicit p: Parameters) extends XSMo
   // S0
   s0.io.replay <> io.replay
   s0.io.prefetchReq <> io.prefetchReq
-  s0.io.vecldin <> io.vecldin
   s0.io.ldin <> io.ldin
   io.tlb.req <> s0.io.tlbReq
   io.dcache.req <> s0.io.dcacheReq
@@ -2029,6 +2113,8 @@ class NewLoadUnit(val param: ExeUnitParams)(implicit p: Parameters) extends XSMo
 
   // S1
   s1.io.redirect := io.redirect
+  s1.io.specialMode := io.specialMode
+  s1.io.robHeadPtr := io.robHeadPtr
   s1.io.tlbResp <> io.tlb.resp
   io.tlb.req_kill := s1.io.tlbReqKill
   io.tlb.req.bits.pmp_addr := s1.io.tlbPAddr // TODO
@@ -2056,6 +2142,8 @@ class NewLoadUnit(val param: ExeUnitParams)(implicit p: Parameters) extends XSMo
 
   // S2
   s2.io.redirect := io.redirect
+  s2.io.specialMode := io.specialMode
+  s2.io.robHeadPtr := io.robHeadPtr
   s2.io.pmp := io.pmp
   s2.io.tlbHint := io.tlbHint
   io.dcache.s2_kill := s2.io.dcacheKill
@@ -2076,13 +2164,14 @@ class NewLoadUnit(val param: ExeUnitParams)(implicit p: Parameters) extends XSMo
   io.prefetchTrain.valid := GatedValidRegNext(s2.io.prefetchTrain.valid)
   io.prefetchTrain.bits := RegEnable(s2.io.prefetchTrain.bits, s2.io.prefetchTrain.valid)
   s2.io.csrCtrl := io.csrCtrl
+  s2.io.stdDataWrite := io.stdDataWrite
 
   // S3
   s3.io.redirect := io.redirect
   s3.io.dcacheError := io.dcache.resp.bits.error_delayed
   io.ldout <> s3.io.ldout
+  io.vldout := s3.io.vldout
   io.lqWrite <> s3.io.lqWrite
-  io.vecldout <> s3.io.vecldout
   s3.io.rarNukeQueryResp := io.rarNukeQuery.resp
   io.rarNukeQuery.revokeLastCycle := s3.io.revokeLastCycle
   io.rarNukeQuery.revokeLastLastCycle := s3.io.revokeLastLastCycle
@@ -2095,7 +2184,9 @@ class NewLoadUnit(val param: ExeUnitParams)(implicit p: Parameters) extends XSMo
   s3.io.perfLqFull := io.perfLqFull
   io.perfMdpAddr := s3.io.perfMdpAddr
   io.exceptionInfo := s3.io.exceptionInfo
+  io.sourceExecuteFailRobHead := s3.io.sourceExecuteFailRobHead
   s3.io.csrCtrl := io.csrCtrl
+  io.vldS3WakeUp := s3.io.vldS3WakeUp
 
   // Data path
   dataPath.io.s2SqForwardResp := io.sqForward.s2Resp
@@ -2108,7 +2199,8 @@ class NewLoadUnit(val param: ExeUnitParams)(implicit p: Parameters) extends XSMo
   dataPath.io.s2DCacheResp.bits := io.dcache.resp.bits
   io.ldout.toFpRf.foreach(_.bits.data := dataPath.io.s3ShiftAndExtData(io.ldout.toFpRf.get.bits.data.getWidth - 1, 0))
   io.ldout.toIntRf.foreach(_.bits.data := dataPath.io.s3ShiftAndExtData(io.ldout.toIntRf.get.bits.data.getWidth - 1, 0))
-  io.vecldout.bits.vecdata.get := dataPath.io.s3ShiftData
+  io.vldout.toVecRf.foreach(_.bits := dataPath.io.s3ShiftData)
+  io.vldout.toV0Rf.foreach(_.bits := dataPath.io.s3ShiftData)
 
   // rr bank-conflict fast replay arbiter
   val rrBankConflictFastReplay = io.rrBankConflictFastReplay
@@ -2245,6 +2337,8 @@ class NewLoadUnitTop(implicit val p: Parameters) extends Module
   with HasMemBlockParameters {
   val param = ldaParams.head
   param.bindBackendParam(backendParams)
+  val issueBlockParam = intSchdParams.issueBlockParams.find(_.allExuParams.contains(param)).get
+  param.bindIssueBlockParam(issueBlockParam)
   val io = IO(new LoadUnitIO(param))
   val ldu = Module(new NewLoadUnit(param))
   io <> ldu.io

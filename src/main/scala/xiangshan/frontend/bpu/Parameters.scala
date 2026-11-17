@@ -70,8 +70,9 @@ trait HasBpuParameters extends HasFrontendParameters {
 
   def NumAheadBtbPredictionEntries: Int = bpuParameters.abtbParameters.NumWays
 
-  def NumBtbAlignBanks:    Int = FetchBlockSize / FetchBlockAlignSize
-  def NumBtbResultEntries: Int = bpuParameters.mbtbParameters.NumWay * NumBtbAlignBanks
+  def NumBtbAlignBanks: Int = FetchBlockSize / FetchBlockAlignSize
+  def NumBtbResultEntries: Int =
+    (bpuParameters.mbtbParameters.NumWay + 1) * NumBtbAlignBanks // one VBTB result per align bank
 
   def GhrShamt:          Int = NumBtbResultEntries
   def GhrHistoryLength:  Int = bpuParameters.scParameters.GlobalTableInfos.map(_.HistoryLength).max
@@ -80,10 +81,16 @@ trait HasBpuParameters extends HasFrontendParameters {
 
   def CompareAddrLowWidth: Int = bpuParameters.mbtbParameters.TargetWidth
 
+  def MaxBtbTargetWidth: Int = Seq(
+    bpuParameters.mbtbParameters.TargetWidth + (if (bpuParameters.mbtbParameters.EnableTargetFix) 1 else 0),
+    bpuParameters.ubtbParameters.TargetWidth + (if (bpuParameters.ubtbParameters.EnableTargetFix) 1 else 0),
+    bpuParameters.abtbParameters.TargetWidth + (if (bpuParameters.abtbParameters.EnableTargetFix) 1 else 0)
+  ).max
+
   // phr history
   def AllFoldedHistoryInfo: Set[FoldedHistoryInfo] =
     bpuParameters.tageParameters.TableInfos.map {
-      _.getFoldedHistoryInfoSet(bpuParameters.tageParameters.NumBanks, bpuParameters.tageParameters.TagWidth)
+      _.getFoldedHistoryInfoSet(bpuParameters.tageParameters.TagWidth)
     }.reduce(_ ++ _) ++
       bpuParameters.ittageParameters.TableInfos.map {
         _.getFoldedHistoryInfoSet(bpuParameters.ittageParameters.TagWidth, bpuParameters.ittageParameters.NumBanks)

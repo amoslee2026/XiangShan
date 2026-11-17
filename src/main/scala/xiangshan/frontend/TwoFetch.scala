@@ -32,13 +32,26 @@ class TwoPrefetchCase extends Bundle {
   def valid: Bool = !isConflict
 
   // select 2 vaddr to read ICacheMetaArray
-  def selectMetaVAddr(reqVec: Vec[PrefetchReqBundle]): Vec[PrunedAddr] =
+  def selectMetaVAddr(reqVec: Vec[PrefetchReqBundle]): Vec[GuardedPc] =
     MuxCase(
       // unable to do 2-prefetch, or isSameLine or isOverlap1, both use req1's start and nextLine
       VecInit(reqVec(0).startVAddr, reqVec(0).nextLineVAddr),
       Seq(
         isOverlap2   -> VecInit(reqVec(1).startVAddr, reqVec(1).nextLineVAddr),
         isInterleave -> VecInit(reqVec(0).startVAddr, reqVec(1).startVAddr)
+      )
+    )
+
+  // timing optimization:
+  // To avoid introducing a very wide adder on the meta SRAM read path,
+  // vSetIdx(1) comes from vSetIdx(0) + 1.U rather than get_idx(nextLineVAddr).
+  def selectMetaSetIdx(reqVec: Vec[PrefetchReqBundle]): Vec[UInt] =
+    MuxCase(
+      // unable to do 2-prefetch, or isSameLine or isOverlap1, both use req1's start and nextLine
+      reqVec(0).vSetIdx,
+      Seq(
+        isOverlap2   -> reqVec(1).vSetIdx,
+        isInterleave -> VecInit(reqVec(0).vSetIdx(0), reqVec(1).vSetIdx(0))
       )
     )
 
@@ -102,13 +115,20 @@ object TwoPrefetchCase {
 
   def Interleave: TwoPrefetchCase = apply(Value.Interleave)
 
-  def apply(reqVec: Vec[FtqPrefetchReq], canAssert: Bool): TwoPrefetchCase =
-    TwoPrefetchCase(
-      reqVec(0).vSetIdx(0) === reqVec(1).vSetIdx(0),                                                    // sameLine
-      reqVec(0).isCrossLine && !reqVec(1).isCrossLine && reqVec(0).vSetIdx(1) === reqVec(1).vSetIdx(0), // overlap1
-      !reqVec(0).isCrossLine && reqVec(1).isCrossLine && reqVec(1).vSetIdx(1) === reqVec(0).vSetIdx(0), // overlap2
-      !reqVec(0).isCrossLine && !reqVec(1).isCrossLine && reqVec(0).vSetIdx(0)(0) =/= reqVec(1).vSetIdx(0)(0), // inter
-      canAssert
+  def apply(reqVec: Vec[Valid[FtqPrefetchReq]], canAssert: Bool): TwoPrefetchCase =
+    Mux(
+      reqVec(0).bits.vPageNumber === reqVec(1).bits.vPageNumber && reqVec.map(_.valid).reduce(_ && _),
+      apply(
+        sameLine = reqVec(0).bits.vSetIdx(0) === reqVec(1).bits.vSetIdx(0),
+        overlap1 = reqVec(0).bits.isCrossLine && !reqVec(1).bits.isCrossLine &&
+          reqVec(0).bits.vSetIdx(1) === reqVec(1).bits.vSetIdx(0),
+        overlap2 = !reqVec(0).bits.isCrossLine && reqVec(1).bits.isCrossLine &&
+          reqVec(1).bits.vSetIdx(1) === reqVec(0).bits.vSetIdx(0),
+        interleave = !reqVec(0).bits.isCrossLine && !reqVec(1).bits.isCrossLine &&
+          reqVec(0).bits.vSetIdx(0)(0) =/= reqVec(1).bits.vSetIdx(0)(0),
+        canAssert = canAssert && reqVec.map(_.valid).reduce(_ && _)
+      ),
+      Conflict
     )
 
   def apply(sameLine: Bool, overlap1: Bool, overlap2: Bool, interleave: Bool, canAssert: Bool): TwoPrefetchCase =

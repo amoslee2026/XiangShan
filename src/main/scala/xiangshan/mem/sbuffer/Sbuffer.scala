@@ -200,6 +200,7 @@ class Sbuffer(implicit p: Parameters)
     val sqempty = Input(Bool())
     val physicalStoreQueueFull = Input(Bool())
     val sbempty = Output(Bool())
+    val sbFull  = Output(Bool())
     val mshr_store_empty = Input(Bool()) // sbuffer-flush must flush all store entries in mshr as well
     val flush = Flipped(new SbufferFlushBundle)
     val csrCtrl = Flipped(new CustomCSRCtrlIO)
@@ -207,6 +208,8 @@ class Sbuffer(implicit p: Parameters)
     val memSetPattenDetected = Input(Bool())
     val force_write = Input(Bool())
     val diffStore = Input(new DiffStoreIO)
+    val diffStoreOffset = Option.when(env.EnableDifftest)(Input(Vec(EnsbufferWidth, UInt(log2Ceil(RenameWidth + 1).W))))
+    val diffStorePreCommit = Option.when(env.EnableDifftest)(Input(Vec(EnsbufferWidth, Bool())))
   })
 
   val dataModule = Module(new SbufferData)
@@ -287,7 +290,7 @@ class Sbuffer(implicit p: Parameters)
   // insert and merge: cohCount=0
   // every cycle cohCount+=1
   // if cohCount(EvictCountBits-1)==1, evict
-  val cohTimeOutMask_wire = VecInit(widthMap(i => cohCount(i) >= io.csrCtrl.sbuffer_timeout && stateVec(i).isActive()))
+  val cohTimeOutMask_wire = VecInit(widthMap(i => cohCount(i) >= io.csrCtrl.sbufferTimeout && stateVec(i).isActive()))
   val cohTimeOutMask = RegInit(VecInit(Seq.fill(StoreBufferSize)(false.B)))
   cohTimeOutMask := cohTimeOutMask_wire
   val (cohTimeOutIdx, cohHasTimeOut) = PriorityEncoderWithFlag(cohTimeOutMask)
@@ -552,6 +555,7 @@ class Sbuffer(implicit p: Parameters)
   XSDebug(p"ActiveCount[$ActiveCount]\n")
 
   io.sbempty := GatedValidRegNext(cmo_empty)
+  io.sbFull  := GatedValidRegNext(ValidCount === (StoreBufferSize).U)
   io.flush.empty := GatedValidRegNext(all_empty)
   // lru.io.flush := sbuffer_state === x_drain_all && empty
   switch(sbuffer_state){
@@ -814,8 +818,8 @@ class Sbuffer(implicit p: Parameters)
     val inflight_tag_matches = widthMap(w => tag_matches(w) && inflightMask(w))
     val line_offset_mask = UIntToOH(getVWordOffset(s1Paddr))
 
-    val valid_tag_match_reg = valid_tag_matches.map(RegEnable(_, s1ReqValid))
-    val inflight_tag_match_reg = inflight_tag_matches.map(RegEnable(_, s1ReqValid))
+    val valid_tag_match_reg = valid_tag_matches.map(RegEnable(_, false.B, s1ReqValid))
+    val inflight_tag_match_reg = inflight_tag_matches.map(RegEnable(_, false.B, s1ReqValid))
     val forward_mask_candidate_reg = RegEnable(
       VecInit(mask.map(entry => entry(getVWordOffset(s1Paddr)))),
       s1ReqValid
@@ -897,21 +901,6 @@ class Sbuffer(implicit p: Parameters)
     val VecMemFLOWMaxNumber = 16
     val WlineMaxNumber = blockWords
 
-    def UIntSlice(in: UInt, High: UInt, Low: UInt): UInt = {
-      val maxNum = in.getWidth
-      val result = Wire(Vec(maxNum, Bool()))
-
-      for (i <- 0 until maxNum) {
-        when (Low + i.U <= High) {
-          result(i) := in(Low + i.U)
-        }.otherwise{
-          result(i) := 0.U
-        }
-      }
-
-      result.asUInt
-    }
-
     // To align with 'nemu', we need:
     //  For 'unit-store' and 'whole' vector store instr, we re-split here,
     //  and for the res, we do nothing.
@@ -920,16 +909,18 @@ class Sbuffer(implicit p: Parameters)
 
       val uop              = io.diffStore.diffInfo(i).uop
 
-      val isVse           = isVStore(uop.fuType) && LSUOpType.isUStride(uop.fuOpType)
-      val isVsm           = isVStore(uop.fuType) && VstuType.isMasked(uop.fuOpType)
-      val isVsr           = isVStore(uop.fuType) && VstuType.isWhole(uop.fuOpType)
+      val isVse           = LSUOpType.isUStride(uop.fuOpType)
+      val isVsm           = LSUOpType.isMasked(uop.fuOpType)
+      val isVsr           = LSUOpType.isWhole(uop.fuOpType)
 
-      val vpu             = uop.vpu
-      val veew            = uop.vpu.veew
-      val eew             = EewLog2(veew)
-      val EEB             = (1.U << eew).asUInt //Only when VLEN=128 effective element byte
-      val EEWBits         = (EEB << 3.U).asUInt
-      val nf              = Mux(isVsr, 0.U, vpu.nf)
+      // log2(eew) - 3
+      // 0: eew = 8
+      // 3: eew = 64
+      val log2eewM3       = LSUOpType.vecElemSize(uop.fuOpType)
+      // EEB = EEW / 8 = 2^(log2(EEW) - 3)
+      val EEB             = (1.U << log2eewM3).asUInt //Only when VLEN=128 effective element byte
+      val EEW         = (EEB << 3.U).asUInt
+      val nf              = 0.U
 
       val isSegment       = nf =/= 0.U && !isVsm
       val isVSLine        = (isVse || isVsm || isVsr) && !isSegment
@@ -939,7 +930,7 @@ class Sbuffer(implicit p: Parameters)
       // No other vector instructions need to be considered.
       val flow            = Mux(
                               isVSLine,
-                              (16.U >> eew).asUInt,
+                              (16.U >> log2eewM3).asUInt,
                               0.U
                             )
 
@@ -962,35 +953,15 @@ class Sbuffer(implicit p: Parameters)
 
       difftestCommon.pc           := io.diffStore.diffInfo(i).uop.pc
       difftestCommon.robidx       := io.diffStore.diffInfo(i).uop.robIdx.value
+      difftestCommon.storeOffset  := io.diffStoreOffset.get(i)
+      difftestCommon.preCommit    := io.diffStorePreCommit.get(i)
 
-      // Except for normal scalar stores, all other address and data operations are handled within difftest.
-      when (isVSLine) {
-        difftestCommon.addr     := rawAddr
-        difftestCommon.data  := rawData(63, 0)
-        difftestCommon.highData := rawData(127, 64)
-        difftestCommon.mask     := rawMask
-      }.elsewhen (isWline) {
-        difftestCommon.addr     := rawAddr
-        difftestCommon.data  := rawData(63, 0)
-        difftestCommon.highData := rawData(127, 64)
-        difftestCommon.mask     := rawMask
-        assert(!storeCommitValid || rawData === 0.U, "wline only supports whole zero write now")
-      }.otherwise { // Normal scalar store
-        val isHighPart        = io.diffStore.cacheableStore(i).bits.diffIsHighPart
-        val waddr             = ZeroExt(Cat(io.diffStore.cacheableStore(i).bits.addr(PAddrBits - 1, 4), isHighPart, 0.U(3.W)), 64)
-        val sbufferMask       = Mux(isHighPart,
-          io.diffStore.cacheableStore(i).bits.mask(io.diffStore.cacheableStore(i).bits.mask.getWidth - 1, 8),
-          io.diffStore.cacheableStore(i).bits.mask(7, 0))
-        val sbufferData       = Mux(isHighPart,
-          io.diffStore.cacheableStore(i).bits.data(io.diffStore.cacheableStore(i).bits.data.getWidth - 1, 64),
-          io.diffStore.cacheableStore(i).bits.data(63, 0))
-        val wmask = sbufferMask
-        val wdata = sbufferData & MaskExpand(sbufferMask)
-        difftestCommon.addr     := waddr
-        difftestCommon.data  := wdata
-        difftestCommon.highData := 0.U
-        difftestCommon.mask     := wmask
-      }
+      difftestCommon.addr     := rawAddr
+      difftestCommon.data     := rawData(63, 0)
+      difftestCommon.highData := rawData(127, 64)
+      difftestCommon.mask     := rawMask
+
+      assert(!storeCommitValid || rawData === 0.U || !isWline, "wline only supports whole zero write now")
     }
     println("PMA Store: diffStoreEventCount = " + diffStoreEventCount)
 
@@ -1010,6 +981,8 @@ class Sbuffer(implicit p: Parameters)
     ncmmStoreEvent.offset := 0.U
     ncmmStoreEvent.pc := io.diffStore.diffInfo(0).uop.pc
     ncmmStoreEvent.robidx := io.diffStore.diffInfo(0).uop.robIdx.value
+    ncmmStoreEvent.storeOffset := io.diffStoreOffset.get(0)
+    ncmmStoreEvent.preCommit := io.diffStorePreCommit.get(0)
   }
 
 

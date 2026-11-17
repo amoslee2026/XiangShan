@@ -63,6 +63,8 @@ object Bundles {
     val memBackTypeMM = Bool()
     val isHyper = Bool()
     val isForVSnonLeafPTE = Bool()
+    val specialModeEligible = Bool()
+    val specialModeRequest = Bool()
     val isvec = Bool()
     val isLastElem = Bool()
     val is128bit = Bool()
@@ -97,7 +99,7 @@ object Bundles {
     val loadWaitStrict = Bool()
     val ssid = UInt(SSIDWidth.W)
     val storeSetHit = Bool() // inst has been allocated an store set
-    val waitForRobIdx = new RobPtr // store set predicted previous store robIdx
+    val waitSqIdx = new SqPtr // store set predicted previous store sqIdx
 
     val debug_robIdx = OptionWrapper(debugEn, new RobPtr)
   }
@@ -317,6 +319,9 @@ object Bundles {
     //  robIdx: Requestor's (a store instruction) rob index for match logic.
     val robIdx = new RobPtr
 
+    // sqIdx: Requestor's full store queue pointer for precise MDP matching.
+    val sqIdx = new SqPtr
+
     //  paddr: requestor's (a store instruction) physical address for match logic.
     val paddr  = UInt(PAddrBits.W)
 
@@ -345,11 +350,6 @@ object Bundles {
 
       val uop = new DynInst()
     })
-  }
-
-  class StoreMaBufToVecStoreMergeBufferIO(implicit p: Parameters)  extends VLSUBundle{
-    val mbIndex = Output(UInt(vsmBindexBits.W))
-    val flush   = Output(Bool())
   }
 
   // Store byte valid mask write bundle
@@ -450,7 +450,6 @@ class DifftestPmaStoreIO(implicit p: Parameters) extends XSBundle {
   val addr           = UInt(PAddrBits.W)
   val wline          = Bool()
   val vecValid       = Bool()
-  val diffIsHighPart = Bool() // indicate whether valid data in high 64-bit, only for scalar store event!
 }
 
 class DiffStoreIO(implicit p: Parameters) extends XSBundle{

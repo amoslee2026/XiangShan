@@ -24,14 +24,15 @@ import utility._
 import xiangshan._
 import xiangshan.backend.Bundles.{DynInst, ExuOutput, IssueQueueLRQWakeUpBundle, MemExuOutput, MemToRob, UopIdx, connectSamePort}
 import xiangshan.backend._
-import xiangshan.backend.rob.{RobLsqIO, RobPtr}
+import xiangshan.backend.rob.RobPtr
+import xiangshan.backend.rob.Rob.RobLsqIO
 import xiangshan.backend.fu.FuType
 import xiangshan.backend.fu.vector.Bundles.NumLsElem
 import xiangshan.mem.Bundles._
 import xiangshan.cache._
 import xiangshan.cache.{DCacheLineIO, DCacheWordIO, MemoryOpConstants}
 import xiangshan.cache.{CMOReq, CMOResp}
-import xiangshan.cache.mmu.{TlbHintIO, TlbRequestIO}
+import xiangshan.cache.mmu.{TLBHintResp, TlbHintIO, TlbRequestIO}
 
 class ExceptionAddrIO(implicit p: Parameters) extends XSBundle {
   val isStore = Input(Bool())
@@ -90,8 +91,6 @@ class LsqWrapper(implicit p: Parameters) extends XSModule
   val io = IO(new Bundle() {
     val hartId = Input(UInt(hartIdLen.W))
     val brqRedirect = Flipped(ValidIO(new Redirect))
-    val stvecFeedback = Vec(VecStorePipelineWidth, Flipped(ValidIO(new FeedbackToLsqIO)))
-    val ldvecFeedback = Vec(VecLoadPipelineWidth, Flipped(ValidIO(new FeedbackToLsqIO)))
     val enq = new LsqEnqIO
     val ldu = new Bundle() {
       val rawNukeQuery = Vec(LoadPipelineWidth, Flipped(new LoadRAWNukeQuery()))
@@ -136,6 +135,7 @@ class LsqWrapper(implicit p: Parameters) extends XSModule
     val issuePtrExt = Output(new SqPtr)
     val l2_hint = Input(Vec(cfg.numMemChannels, Valid(new L2ToL1Hint())))
     val tlb_hint = Flipped(new TlbHintIO)
+    val fast_tlb_hint = Flipped(ValidIO(new TLBHintResp))
     val wakeupToLRQ = Vec(StaCnt + StdCnt, Flipped(ValidIO(new IssueQueueLRQWakeUpBundle)))
     val wakeupToLRQCancel = Input(Vec(StaCnt + StdCnt, new LRQWakeUpCancelBundle))
     val cmoOpReq  = DecoupledIO(new CMOReq)
@@ -150,7 +150,8 @@ class LsqWrapper(implicit p: Parameters) extends XSModule
     val ldExceptionInfo = ValidIO(new MemExceptionInfo)
     // top-down
     val debugTopDown = new LoadQueueTopDownIO
-    val noUopsIssued = Input(Bool())
+    val replayAllocate = Output(Bool())
+    val specialMode = Output(Bool())
 
     val diffStore = OptionWrapper(debugEn, Flipped(new DiffStoreIO))
   })
@@ -189,7 +190,7 @@ class LsqWrapper(implicit p: Parameters) extends XSModule
     storeQueue.io.enq.req(i).bits.reqStartPtr := io.enq.req(i).bits.reqStartPtr
     storeQueue.io.enq.req(i).valid          := io.enq.needAlloc(i)(1) && io.enq.req(i).valid
     connectSamePort(storeQueue.io.enq.req(i).bits.uop, io.enq.req(i).bits.uop)
-    storeQueue.io.enq.req(i).bits.uop.isVec := FuType.isVStore(io.enq.req(i).bits.uop.fuType)
+    storeQueue.io.enq.req(i).bits.uop.isVec := LSUOpType.isVecMemOp(io.enq.req(i).bits.uop.fuOpType)
     // only enable difftest, it will be used.
     if(env.EnableDifftest){
       storeQueue.io.enq.req(i).bits.debugUop.get := io.enq.req(i).bits.uop
@@ -202,7 +203,6 @@ class LsqWrapper(implicit p: Parameters) extends XSModule
 
   // store queue wiring
   storeQueue.io.redirect                      <> io.brqRedirect
-  storeQueue.io.fromVMergeBuffer              <> io.stvecFeedback
   storeQueue.io.fromStoreUnit.unalignQueueReq <> io.sta.unalignQueueReq
   storeQueue.io.fromStoreUnit.storeAddrIn     <> io.sta.storeAddrIn // from store_s1
   storeQueue.io.fromStoreUnit.storeAddrInRe   <> io.sta.storeAddrInRe // from store_s2
@@ -232,7 +232,6 @@ class LsqWrapper(implicit p: Parameters) extends XSModule
 
   //  load queue wiring
   loadQueue.io.redirect            <> io.brqRedirect
-  loadQueue.io.vecFeedback         <> io.ldvecFeedback
   loadQueue.io.ldu                 <> io.ldu
   loadQueue.io.rob.pendingPtr      := io.rob.pendingPtr
   loadQueue.io.rob.pendingPtrNext  := io.rob.pendingPtrNext
@@ -258,6 +257,7 @@ class LsqWrapper(implicit p: Parameters) extends XSModule
   loadQueue.io.bypass              <> io.bypass
   loadQueue.io.l2_hint             <> io.l2_hint
   loadQueue.io.tlb_hint            <> io.tlb_hint
+  loadQueue.io.fast_tlb_hint       <> io.fast_tlb_hint
   loadQueue.io.wakeupToLRQ         <> io.wakeupToLRQ
   loadQueue.io.wakeupToLRQCancel   := io.wakeupToLRQCancel
   loadQueue.io.lqEmpty             <> io.lqEmpty
@@ -277,7 +277,7 @@ class LsqWrapper(implicit p: Parameters) extends XSModule
   val pendingstate = RegInit(s_idle)
   val selectLq = (loadQueue.io.uncache.req.valid && !storeQueue.io.toUncacheBuffer.req.valid) || (
     loadQueue.io.uncache.req.valid && storeQueue.io.toUncacheBuffer.req.valid &&
-    loadQueue.io.uncache.req.bits.robIdx < storeQueue.io.toUncacheBuffer.req.bits.robIdx
+    loadQueue.io.uncache.req.bits.robIdx.isBeforeSlot(storeQueue.io.toUncacheBuffer.req.bits.robIdx)
   )
 
   switch(pendingstate){
@@ -331,7 +331,8 @@ class LsqWrapper(implicit p: Parameters) extends XSModule
   }
 
   loadQueue.io.debugTopDown <> io.debugTopDown
-  loadQueue.io.noUopsIssed := io.noUopsIssued
+  loadQueue.io.replayAllocate <> io.replayAllocate
+  io.specialMode := loadQueue.io.specialMode
 
   assert(!(loadQueue.io.uncache.resp.valid && storeQueue.io.toUncacheBuffer.resp.valid))
   assert(!(loadQueue.io.uncache.idResp.valid && storeQueue.io.toUncacheBuffer.idResp.valid))
@@ -377,8 +378,8 @@ class LsqEnqCtrl(implicit p: Parameters) extends XSModule
     val waitLsqRecover = Value // wait lsq recover pointer
   }
 
-  private val lqDeq = Mux(io.lqDeq.valid, io.lqDeq.bits, 0.U)
-  private val sqDeq = Mux(io.sqDeq.valid, io.sqDeq.bits, 0.U)
+  private val lqDeq = RegNext(Mux(io.lqDeq.valid, io.lqDeq.bits, 0.U), 0.U)
+  private val sqDeq = RegNext(Mux(io.sqDeq.valid, io.sqDeq.bits, 0.U), 0.U)
 
   val lqHeadPtr = RegInit(0.U.asTypeOf(new LqPtr))
   val sqHeadPtr = RegInit(0.U.asTypeOf(new SqPtr))
@@ -410,8 +411,8 @@ class LsqEnqCtrl(implicit p: Parameters) extends XSModule
 
   // rename pre-calculate sqPtr/lqPtr
   val numLsElem = io.fromRename.req.map(_.bits.num)
-  val needEnqLoadQueue = VecInit(io.fromRename.req.map(x => x.valid && (FuType.isLoad(x.bits.fuType) || FuType.isVNonsegLoad(x.bits.fuType))))
-  val needEnqStoreQueue = VecInit(io.fromRename.req.map(x => x.valid && (FuType.isStore(x.bits.fuType) || FuType.isVNonsegStore(x.bits.fuType))))
+  val needEnqLoadQueue = VecInit(io.fromRename.req.map(x => x.valid && FuType.isLoad(x.bits.fuType)))
+  val needEnqStoreQueue = VecInit(io.fromRename.req.map(x => x.valid && FuType.isStore(x.bits.fuType)))
   val loadQueueElem = needEnqLoadQueue.zip(numLsElem).map(x => Mux(x._1, x._2, 0.U))
   val storeQueueElem = needEnqStoreQueue.zip(numLsElem).map(x => Mux(x._1, x._2, 0.U))
   val loadFlowPopCount = 0.U +: loadQueueElem.zipWithIndex.map{ case (l, i) =>
@@ -460,7 +461,7 @@ class LsqEnqCtrl(implicit p: Parameters) extends XSModule
       lqTailPtr.addWrapCircles(lqAllocNumber)
     )
   )
-  // sqRedirect will arrive after 3 -> (3 + virtual store queue walk cycles) cycle of io.redirect.
+  // sqRedirect will arrive after 4 -> (4 + virtual store queue walk cycles) cycle of io.redirect.
   val sqTailPtrNext = Mux(io.sqRedirectPtr.valid,
     io.sqRedirectPtr.bits,
     Mux(io.redirect.valid,

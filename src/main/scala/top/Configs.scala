@@ -29,6 +29,7 @@ import xiangshan.frontend.FrontendParameters
 import xiangshan.frontend.bpu.BpuParameters
 import xiangshan.frontend.bpu.TageTableInfo
 import xiangshan.frontend.bpu.IttageTableInfo
+import xiangshan.frontend.bpu.ScTableInfo
 import xiangshan.frontend.bpu.MicroTageInfo
 import xiangshan.frontend.bpu.mbtb.MainBtbParameters
 import xiangshan.frontend.bpu.tage.TageParameters
@@ -41,6 +42,7 @@ import xiangshan.frontend.icache.ICacheParameters
 import xiangshan.frontend.ibuffer.IBufferParameters
 import freechips.rocketchip.devices.debug._
 import xscache.openLLC.OpenLLCParam
+import zhujiang.ZJParameters
 import freechips.rocketchip.diplomacy._
 import xiangshan.backend.regfile._
 import xiangshan.cache.DCacheParameters
@@ -49,6 +51,21 @@ import device.EnableJtag
 import xscache.coupledL2._
 import xscache.coupledL2.prefetch._
 import xscache.common.DirtyField
+
+case object EnableIommuKey extends Field[Boolean](false)
+
+object LLCType extends Enumeration {
+  val OpenLLC, ZhuJiang = Value
+}
+
+private[top] object CacheSizeParser {
+  def toBytes(size: String): Int = size.toUpperCase.replace(" ", "") match {
+    case s"${k}KB" => k.trim.toInt * 1024
+    case s"${m}MB" => (m.trim.toDouble * 1024 * 1024).toInt
+    case s"${g}GB" => (g.trim.toDouble * 1024 * 1024 * 1024).toInt
+    case bytes => bytes.trim.toInt
+  }
+}
 
 class BaseConfig(n: Int) extends Config((site, here, up) => {
   case XLen => 64
@@ -104,10 +121,11 @@ class MinimalConfig(n: Int = 1) extends Config(
           frontendParameters = FrontendParameters(
             FetchBlockSize = 32, // in bytes
             bpuParameters = BpuParameters(
-              // FIXME: these are from V2 Ftb(Size=512, Way=2), may not correct
               mbtbParameters = MainBtbParameters(
-                // NumEntries = 512,
-                // NumWay = 2
+                NumEntries = 512,
+                NumWay = 2,
+                NumInternalBanks = 2,
+                WriteBufferSize = 2
               ),
               tageParameters = TageParameters(
                 TableInfos = Seq(
@@ -124,11 +142,16 @@ class MinimalConfig(n: Int = 1) extends Config(
                   new MicroTageInfo(512, 12, 6, 15)
                 ),
               ),
-              // FIXME: these are from V2 SC, we don't have equivalent parameters now
               scParameters = ScParameters(
-                // NumRows = 128,
-                // NumTables = 2,
-                // HistLens = Seq(0, 5),
+                PathTableInfos = Seq(
+                  new ScTableInfo(128, 8)
+                ),
+                GlobalTableInfos = Seq(
+                  new ScTableInfo(128, 8)
+                ),
+                BackwardTableInfos = Seq(
+                  new ScTableInfo(128, 4)
+                )
               ),
               ittageParameters = IttageParameters(
                 TableInfos = Seq(
@@ -198,32 +221,24 @@ class MinimalConfig(n: Int = 1) extends Config(
           ldtlbParameters = TLBParameters(
             name = "ldtlb",
             NWays = 4,
-            partialStaticPMP = true,
-            outsideRecvFlush = true,
             outReplace = false,
             lgMaxSize = 4
           ),
           sttlbParameters = TLBParameters(
             name = "sttlb",
             NWays = 4,
-            partialStaticPMP = true,
-            outsideRecvFlush = true,
             outReplace = false,
             lgMaxSize = 4
           ),
           hytlbParameters = TLBParameters(
             name = "hytlb",
             NWays = 4,
-            partialStaticPMP = true,
-            outsideRecvFlush = true,
             outReplace = false,
             lgMaxSize = 4
           ),
           pftlbParameters = TLBParameters(
             name = "pftlb",
             NWays = 4,
-            partialStaticPMP = true,
-            outsideRecvFlush = true,
             outReplace = false,
             lgMaxSize = 4
           ),
@@ -302,6 +317,7 @@ case class L2CacheConfig
   banks: Int = 1,
   tp: Boolean = true,
   nl: Boolean = false,
+  cdp: Boolean = true,
   enablePC: Boolean = false, // Enable PC field for L1Param
   enableFlush: Boolean = false
 ) extends Config((site, here, up) => {
@@ -338,6 +354,7 @@ case class L2CacheConfig
         prefetch = Seq(BOPParameters()) ++
           (if (tp) Seq(TPParameters()) else Nil) ++
           (if (nl) Seq(NLParameters()) else Nil) ++
+          (if (cdp) Seq(CDPParameters()) else Nil) ++
           (if (p.prefetcher.nonEmpty) Seq(PrefetchReceiverParams()) else Nil),
         enableL2Flush = enableFlush,
         enablePerf = !site(DebugOptionsKey).FPGAPlatform && site(DebugOptionsKey).EnablePerfDebug,
@@ -353,11 +370,8 @@ case class L2CacheConfig
 
 case class OpenLLCConfig(size: String, ways: Int = 8, banks: Int = 1) extends Config((site, here, up) => {
   case SoCParamsKey =>
-    val nKB = size.toUpperCase() match {
-      case s"${k}KB" => k.trim().toInt
-      case s"${m}MB" => (m.trim().toDouble * 1024).toInt
-    }
-    val sets = nKB * 1024 / banks / ways / 64
+    val sizeInBytes = CacheSizeParser.toBytes(size)
+    val sets = sizeInBytes / banks / ways / 64
     val tiles = site(XSTileKey)
     val clientDirBytes = tiles.map { t =>
       t.L2NBanks * t.L2CacheParamsOpt.map(_.toCacheParams.capacity).getOrElse(0)
@@ -381,6 +395,35 @@ case class OpenLLCConfig(size: String, ways: Int = 8, banks: Int = 1) extends Co
         elaboratedTopDown = !site(DebugOptionsKey).FPGAPlatform
       ))
     )
+})
+
+case class LLCConfig(llc: String) extends Config((site, here, up) => {
+  case SoCParamsKey =>
+    val llcType = LLCType.withName(llc)
+    val soc = up(SoCParamsKey).copy(LLC = llcType)
+    if (llcType == LLCType.ZhuJiang) {
+      soc.copy(EnableCHIAsyncBridge = None)
+    } else {
+      soc
+    }
+  case XSTileKey if LLCType.withName(llc) == LLCType.ZhuJiang =>
+    up(XSTileKey).map { tile =>
+      tile.copy(L2CacheParamsOpt = tile.L2CacheParamsOpt.map(_.copy(
+        dataCheck = None,
+        enablePoison = false,
+        bufferableNC = false,
+        endpointOrderNC = true
+      )))
+    }
+})
+
+case class ZhuJiangConfig(size: String, ways: Int = 16) extends Config((site, here, up) => {
+  case SoCParamsKey =>
+    val soc = up(SoCParamsKey)
+    soc.copy(ZhuJiangParams = soc.ZhuJiangParams.copy(
+      cacheSizeInB = CacheSizeParser.toBytes(size),
+      cacheWays = ways
+    ))
 })
 
 class WithL3DebugConfig extends Config(
@@ -502,8 +545,7 @@ class CVMCompile extends Config((site, here, up) => {
     HasDelayNoencryption = false
   )
   case XSTileKey => up(XSTileKey).map(_.copy(
-    HasBitmapCheck = true,
-    HasBitmapCheckDefault = false))
+    HasBitmapCheck = true))
 })
 
 class CVMTestCompile extends Config((site, here, up) => {
@@ -513,8 +555,7 @@ class CVMTestCompile extends Config((site, here, up) => {
     HasDelayNoencryption = true
   )
   case XSTileKey => up(XSTileKey).map(_.copy(
-    HasBitmapCheck =true,
-    HasBitmapCheckDefault = true))
+    HasBitmapCheck =true))
 })
 
 class MinimalAliasDebugConfig(n: Int = 1) extends Config(
@@ -532,10 +573,17 @@ class FuzzConfig(dummy: Int = 0) extends Config(
 ) with DeprecatedConfigWarning
 
 class DefaultConfig(n: Int = 1) extends Config(
-  OpenLLCConfig("16MB", ways = 16, banks = 4)
+  OpenLLCConfig("32MB", ways = 16, banks = 4)
+    ++ ZhuJiangConfig("32MB", ways = 16)
     ++ L2CacheConfig("2MB", inclusive = true, banks = 4, tp = false)
     ++ WithNKBL1D(64, ways = 4, numMemChannels = 2)
     ++ new BaseConfig(n)
+)
+
+class NoRobCompressionConfig(n: Int = 1) extends Config(
+  new DefaultConfig(n).alter((site, here, up) => {
+    case XSTileKey => up(XSTileKey).map(_.copy(EnableRobCompression = false))
+  })
 )
 
 class CVMConfig(n: Int = 1) extends Config(
@@ -586,7 +634,7 @@ class FpgaDefaultConfig(n: Int = 1) extends Config(
 
 class FpgaDiffDefaultConfig(n: Int = 1) extends Config(
   (OpenLLCConfig("3MB", banks = 1, ways = 6)
-    ++ L2CacheConfig("1MB", inclusive = true, banks = 4)
+    ++ L2CacheConfig("1MB", inclusive = true, banks = 4, tp = false)
     ++ WithNKBL1D(64, ways = 4)
     ++ new BaseConfig(n)).alter((site, here, up) => {
     case DebugOptionsKey => up(DebugOptionsKey).copy(

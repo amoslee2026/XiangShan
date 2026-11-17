@@ -49,10 +49,27 @@ trait HasStridePrefetchHelper extends HasL1PrefetchHelper {
   val STRIDE_LOOK_AHEAD_BLOCKS = 2 // aggressive degree
   val LOOK_UP_STREAM = false // if true, avoid collision with stream
 
-  val STRIDE_WIDTH_BLOCKS = if(AGGRESIVE_POLICY) STRIDE_LOOK_AHEAD_BLOCKS else 1
+  val STRIDE_WIDTH_BLOCKS_BASE = if(AGGRESIVE_POLICY) STRIDE_LOOK_AHEAD_BLOCKS else 1
+  def STRIDE_WIDTH_BLOCKS(degree: UInt = 1.U): UInt = Mux(
+    degree <= 1.U,
+    STRIDE_WIDTH_BLOCKS_BASE.U,
+    Mux(degree === 2.U, (STRIDE_WIDTH_BLOCKS_BASE * 2).U, (STRIDE_WIDTH_BLOCKS_BASE * 3).U)
+  )
+
 
   def MAX_CONF = (1 << STRIDE_CONF_BITS) - 1
   def CONF_THRESHOLD = (1 << (STRIDE_CONF_BITS-1)) - 1
+}
+
+class StatStrideBundle(implicit p: Parameters) extends XSBundle with HasStridePrefetchHelper {
+  val new_stride = UInt(STRIDE_BITS.W)
+  val dissatisfy = Bool()
+  val overflow = Bool()
+  val valid = Bool()
+  val valid_confirm = Bool()
+  val valid_confirm_sendpf = Bool()
+  val valid_mismatch = Bool()
+  val valid_mismatch_replace = Bool()
 }
 
 class StrideMetaBundle(implicit p: Parameters) extends XSBundle with HasStridePrefetchHelper {
@@ -93,6 +110,16 @@ class StrideMetaBundle(implicit p: Parameters) extends XSBundle with HasStridePr
     val low_confidence = confidence <= 1.U
     val can_send_pf = stride_valid && stride_match && confidence >= CONF_THRESHOLD.U
 
+    val stat = Wire(new StatStrideBundle)
+    stat.new_stride := new_stride
+    stat.dissatisfy := new_stride_blk === 0.U || new_stride_blk === 1.U
+    stat.overflow := new_stride(STRIDE_VADDR_BITS - 1) === 1.U // negtive or overflow
+    stat.valid := stride_valid
+    stat.valid_confirm := stride_valid && stride_match
+    stat.valid_confirm_sendpf := stride_valid && stride_match && confidence === MAX_CONF.U
+    stat.valid_mismatch := stride_valid && !stride_match
+    stat.valid_mismatch_replace := stride_valid && !stride_match && low_confidence
+
     when(stride_valid) {
       when(stride_match) {
         confidence := Mux(confidence === MAX_CONF.U, confidence, confidence + 1.U)
@@ -109,21 +136,22 @@ class StrideMetaBundle(implicit p: Parameters) extends XSBundle with HasStridePr
       pre_vaddr := new_vaddr
     }
 
-    (can_send_pf, new_stride, isDecrMode =/= decr_mode, stride_valid)
+    (can_send_pf, new_stride, isDecrMode =/= decr_mode, stride_valid, stat)
   }
 
 }
 
-class StrideMetaArray(implicit p: Parameters) extends XSModule with HasStridePrefetchHelper {
+class StrideMetaArray(implicit p: Parameters) extends XSModule with HasStridePrefetchHelper with HasPrefetcherParams {
   val io = IO(new XSBundle {
     val enable = Input(Bool())
+    val fdbkDegree = Input(UInt(DEGREE_WIDTH.W))
     // TODO: flush all entry when process changing happens, or disable stream prefetch for a while
     val flush = Input(Bool())
     val dynamic_depth = Input(UInt(32.W)) // TODO: enable dynamic stride depth
     val confidence = Input(UInt(1.W))
     val train_req = Flipped(DecoupledIO(new TrainReqBundle))
     val l1_prefetch_req = ValidIO(new StreamPrefetchReqBundle)
-    val l2_l3_prefetch_req = ValidIO(new StreamPrefetchReqBundle)
+    val l2_prefetch_req = ValidIO(new StreamPrefetchReqBundle)
     // query Stream component to see if a stream pattern has already been detected
     val stream_lookup_req  = ValidIO(UInt(VAddrBits.W))
     val stream_lookup_resp = Input(Bool())
@@ -180,6 +208,8 @@ class StrideMetaArray(implicit p: Parameters) extends XSModule with HasStridePre
 
   val always_update = Constantin.createRecord(s"always_update${p(XSCoreParamsKey).HartId}", initValue = ALWAYS_UPDATE_PRE_VADDR)
 
+  val s1_stat = WireInit(0.U.asTypeOf(new StatStrideBundle))
+
   when(s1_alloc) {
     valids(s1_index) := true.B
     array(s1_index).alloc(
@@ -192,6 +222,7 @@ class StrideMetaArray(implicit p: Parameters) extends XSModule with HasStridePre
     s1_new_stride := res._2
     s1_mode_changed := res._3
     s1_stride_valid := res._4
+    s1_stat := res._5
   }
 
   val l1_stride_ratio_const = Constantin.createRecord(s"l1_stride_ratio${p(XSCoreParamsKey).HartId}", initValue = 2)
@@ -214,9 +245,8 @@ class StrideMetaArray(implicit p: Parameters) extends XSModule with HasStridePre
   val s2_l1_pf_req_bits = (new StreamPrefetchReqBundle).getStreamPrefetchReqBundle(
     valid = s2_valid,
     vaddr = s2_l1_pf_vaddr,
-    width = STRIDE_WIDTH_BLOCKS,
+    width = STRIDE_WIDTH_BLOCKS(),
     decr_mode = s2_decr_mode,
-    sink = SINK_L1,
     source = L1_HW_PREFETCH_STRIDE,
     confidence = io.confidence,
     // TODO: add stride debug db, not useful for now
@@ -224,11 +254,10 @@ class StrideMetaArray(implicit p: Parameters) extends XSModule with HasStridePre
     t_va = 0xdeadbeefL.U
     )
   val s2_l2_pf_req_bits = (new StreamPrefetchReqBundle).getStreamPrefetchReqBundle(
-    valid = s2_valid,
+    valid = s2_valid && io.fdbkDegree > 0.U,
     vaddr = s2_l2_pf_vaddr,
-    width = STRIDE_WIDTH_BLOCKS,
+    width = STRIDE_WIDTH_BLOCKS(io.fdbkDegree),
     decr_mode = s2_decr_mode,
-    sink = SINK_L2,
     source = L1_HW_PREFETCH_STRIDE,
     confidence = io.confidence,
     // TODO: add stride debug db, not useful for now
@@ -247,10 +276,10 @@ class StrideMetaArray(implicit p: Parameters) extends XSModule with HasStridePre
 
   io.l1_prefetch_req.valid := s3_valid && io.enable
   io.l1_prefetch_req.bits := s3_l1_pf_req_bits
-  io.l2_l3_prefetch_req.valid := s4_valid && io.enable
-  io.l2_l3_prefetch_req.bits := s4_l2_pf_req_bits
+  io.l2_prefetch_req.valid := s4_valid && io.enable
+  io.l2_prefetch_req.bits := s4_l2_pf_req_bits
 
-  XSPerfAccumulate("pf_valid", PopCount(Seq(io.l1_prefetch_req.valid, io.l2_l3_prefetch_req.valid)))
+  XSPerfAccumulate("pf_valid", PopCount(Seq(io.l1_prefetch_req.valid, io.l2_prefetch_req.valid)))
   XSPerfAccumulate("l1_pf_valid", s3_valid)
   XSPerfAccumulate("l2_pf_valid", s4_valid)
   XSPerfAccumulate("detect_stream", io.stream_lookup_resp)
@@ -277,4 +306,23 @@ class StrideMetaArray(implicit p: Parameters) extends XSModule with HasStridePre
       reset_array(i)
     }
   }
+
+  XSPerfAccumulate("s1_stat_dissatisfy", s1_stat.dissatisfy)
+  XSPerfAccumulate("s1_stat_overflow", s1_stat.overflow)
+  XSPerfAccumulate("s1_stat_valid", s1_stat.valid)
+  XSPerfAccumulate("s1_stat_valid_confirm", s1_stat.valid_confirm)
+  XSPerfAccumulate("s1_stat_valid_confirm_sendpf", s1_stat.valid_confirm_sendpf)
+  XSPerfAccumulate("s1_stat_valid_mismatch", s1_stat.valid_mismatch)
+  XSPerfAccumulate("s1_stat_valid_mismatch_replace", s1_stat.valid_mismatch_replace)
+  XSPerfAccumulate("stride_l2_feedback_control_drop", s2_valid && io.fdbkDegree === 0.U)
+  class StrideLearn extends Bundle {
+    val stat = new StatStrideBundle()
+    val pc = UInt(VAddrBits.W)
+  }
+  val strideLearn = Wire(new StrideLearn())
+  strideLearn.stat := s1_stat
+  strideLearn.pc := RegEnable(s0_pc, s0_valid)
+  val strideLearnDb = ChiselDB.createTable(s"StrideLearnTable${p(XSCoreParamsKey).HartId}", new StrideLearn, basicDB = true)
+  strideLearnDb.log(data = strideLearn, en = s1_update, clock = clock, reset = reset)
+
 }

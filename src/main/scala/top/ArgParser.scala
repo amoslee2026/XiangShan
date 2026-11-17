@@ -37,19 +37,24 @@ object ArgParser {
       |--xs-help                  print this help message
       |--version                  print version info
       |--config <ConfigClassName>
+      |--llc <OpenLLC|ZhuJiang>
       |--num-cores <Int>
       |--hartidbits <Int>
       |--with-dramsim3
+      |--with-iommu
       |--fpga-platform
       |--reset-gen
       |--enable-difftest
+      |--full-basicdiff
       |--enable-log
       |--with-chiseldb
       |--with-rollingdb
       |--disable-perf
       |--disable-alwaysdb
+      |--external-llc
       |--enable-dfx
       |--enable-simfrontend
+      |--imsic-bus-type <NONE|TL|AXI>
       |--dump-csr
       |""".stripMargin
 
@@ -83,6 +88,8 @@ object ArgParser {
           nextOption(config.alter((site, here, up) => {
             case xscache.chi.CHIIssue => issueString
           }), tail)
+        case "--llc" :: llcString :: tail =>
+          nextOption(config.alter(LLCConfig(llcString)), tail)
         case "--num-cores" :: value :: tail =>
           nextOption(config.alter((site, here, up) => {
             case XSTileKey => (0 until value.toInt) map { i =>
@@ -95,9 +102,21 @@ object ArgParser {
           nextOption(config.alter((site, here, up) => {
             case MaxHartIdBits => hartidbits.toInt
           }), tail)
+        case "--hartid-dmode-width" :: width :: tail =>
+          nextOption(config.alter((site, here, up) => {
+            case XSTileKey => up(XSTileKey).map(_.copy(hartIDDmodeWidth = width.toInt))
+          }), tail)
+        case "--enable-reset-mtvec" :: tail =>
+          nextOption(config.alter((site, here, up) => {
+            case XSTileKey => up(XSTileKey).map(_.copy(enableResetMtvec = true))
+          }), tail)
         case "--with-dramsim3" :: tail =>
           nextOption(config.alter((site, here, up) => {
             case DebugOptionsKey => up(DebugOptionsKey).copy(UseDRAMSim = true)
+          }), tail)
+        case "--with-iommu" :: tail =>
+          nextOption(config.alter((site, here, up) => {
+            case EnableIommuKey => true
           }), tail)
         case "--with-chiseldb" :: tail =>
           nextOption(config.alter((site, here, up) => {
@@ -123,6 +142,10 @@ object ArgParser {
           nextOption(config.alter((site, here, up) => {
             case DebugOptionsKey => up(DebugOptionsKey).copy(EnableDifftest = true)
           }), tail)
+        case "--full-basicdiff" :: tail =>
+          nextOption(config.alter((site, here, up) => {
+            case DebugOptionsKey => up(DebugOptionsKey).copy(FullBasicDiff = true)
+          }), tail)
         case "--disable-always-basic-diff" :: tail =>
           nextOption(config.alter((site, here, up) => {
             case DebugOptionsKey => up(DebugOptionsKey).copy(AlwaysBasicDiff = false)
@@ -142,6 +165,10 @@ object ArgParser {
         case "--disable-alwaysdb" :: tail =>
           nextOption(config.alter((site, here, up) => {
             case DebugOptionsKey => up(DebugOptionsKey).copy(AlwaysBasicDB = false)
+          }), tail)
+        case "--external-llc" :: tail =>
+          nextOption(config.alter((site, here, up) => {
+            case UseExternalLLCKey => true
           }), tail)
         case "--enable-simfrontend" :: tail =>
           nextOption(config.alter((site, here, up) => {
@@ -184,11 +211,15 @@ object ArgParser {
           nextOption(config.alter((site, here, up) => {
             case SoCParamsKey =>
               val socParam = up(SoCParamsKey)
+              val sizeInBytes = value.toInt * 1024
               val banks = socParam.L3NBanks
               val openLLCParam = socParam.OpenLLCParamsOpt.map { llc =>
-                llc.copy(sets = value.toInt * 1024 / banks / llc.ways / 64)
+                llc.copy(sets = sizeInBytes / banks / llc.ways / 64)
               }
-              socParam.copy(OpenLLCParamsOpt = openLLCParam)
+              socParam.copy(
+                OpenLLCParamsOpt = openLLCParam,
+                ZhuJiangParams = socParam.ZhuJiangParams.copy(cacheSizeInB = sizeInBytes)
+              )
           }), tail)
         case "--sim-mem-size" :: value :: tail =>
           nextOption(config.alter((site, here, up) => {
@@ -232,6 +263,11 @@ object ArgParser {
           nextOption(config.alter((site, here, up) => {
             case DebugOptionsKey => up(DebugOptionsKey).copy(DumpCSR = true)
           }), tail)
+        case "--disable-cached-parameters"::tail => {
+          nextOption(config.alter((site, here, up) => {
+            case CachedParameterKey => false
+          }), tail)
+        }
         case option :: tail =>
           // unknown option, maybe a firrtl option, skip
           firrtlOpts :+= option

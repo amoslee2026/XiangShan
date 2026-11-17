@@ -48,7 +48,10 @@ class MemXbar(implicit p: Parameters) extends LazyModule
   val devNode = AXI4MasterNode(Seq(AXI4MasterPortParameters(
     Seq(AXI4MasterParameters(
       name = "device_node",
-      id = IdRange(0, 1 << 14),
+      // IOMMU translated traffic and page-table walks are merged by an AXI
+      // crossbar before reaching this port.  Preserve its full 17-bit ID so
+      // responses can be routed back to the originating IOMMU master.
+      id = IdRange(0, 1 << 17),
       aligned = true
     ))
   )))
@@ -96,8 +99,13 @@ class XiangShanSim(implicit p: Parameters) extends Module with HasDiffTestInterf
   // so that we can re-use this XiangShanSim for any generated Verilog RTL.
   dontTouch(soc.io)
 
-  if (!l_soc.module.dma.isEmpty) {
-    l_soc.module.dma.get <> WireDefault(0.U.asTypeOf(l_soc.module.dma.get))
+  l_soc.module.imsic_axi4.foreach { port =>
+    port <> WireDefault(0.U.asTypeOf(port))
+  }
+  l_soc.module.imsic_axi4s.foreach { ports =>
+    ports.foreach { port =>
+      port <> WireDefault(0.U.asTypeOf(port))
+    }
   }
 
   val l_simMMIO = LazyModule(new SimMMIO(l_soc.misc.peripheralNode.in.head._2)(p.alter((site, here, up) => {
@@ -133,6 +141,7 @@ class XiangShanSim(implicit p: Parameters) extends Module with HasDiffTestInterf
   soc.io.pll0_lock := true.B
   soc.io.cacheable_check := DontCare
   soc.io.riscv_rst_vec.foreach(_ := 0x10000000L.U)
+  soc.io.riscv_rst_mtvec.foreach{ _.foreach(_ := 0.U) }
   l_soc.nmi.foreach(_.foreach(intr => { intr := false.B; dontTouch(intr) }))
   soc.io.traceCoreInterface.foreach(_.fromEncoder.enable := false.B)
   soc.io.traceCoreInterface.foreach(_.fromEncoder.stall  := false.B)
@@ -156,7 +165,7 @@ class XiangShanSim(implicit p: Parameters) extends Module with HasDiffTestInterf
   soc.io.systemjtag.part_number := 0.U(16.W)
   soc.io.systemjtag.version := 0.U(4.W)
 
-  override def cpuName: Option[String] = Some("XiangShan")
+  override def cpuName: Option[String] = Some("XIANGSHAN_KMHV3")
 
   val uart = IO(new UARTIO)
   simMMIO.io.uart <> uart

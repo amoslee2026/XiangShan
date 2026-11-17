@@ -25,26 +25,23 @@ import xiangshan.frontend.bpu.history.phr.PhrAllFoldedHistories
 trait TopHelper extends HasTageParameters {
   def getFoldedHist(allFoldedPathHist: PhrAllFoldedHistories): Vec[TageFoldedHist] =
     VecInit(TableInfos.map { implicit tableInfo =>
-      val tageFoldedHist = tableInfo.getTageFoldedHistoryInfo(NumBanks, TagWidth).map { histInfo =>
+      val tageFoldedHist = tableInfo.getTageFoldedHistoryInfo(TagWidth).map { histInfo =>
         allFoldedPathHist.getHistWithInfo(histInfo).foldedHist
       }
+      val indexHist  = tageFoldedHist.head.pad(SetIdxWidth + BankIdxWidth)
       val foldedHist = Wire(new TageFoldedHist)
-      foldedHist.forIdx    := tageFoldedHist.head
-      foldedHist.forTag(0) := tageFoldedHist(1)
-      foldedHist.forTag(1) := Cat(tageFoldedHist(2), 0.U(1.W))
+      foldedHist.forBankIdx := indexHist(BankIdxWidth - 1, 0)
+      foldedHist.forSetIdx  := indexHist(SetIdxWidth + BankIdxWidth - 1, BankIdxWidth)
+      foldedHist.forTag(0)  := tageFoldedHist(1)
+      foldedHist.forTag(1)  := Cat(tageFoldedHist(2), 0.U(1.W))
       foldedHist
     })
 
   def getLongestHistTableOH(hitTableMask: Seq[Bool]): Seq[Bool] =
     PriorityEncoderOH(hitTableMask.reverse).reverse
-
-  def getUseAltOnNaIdx(pc: PrunedAddr): UInt = {
-    val useAltOnNaIdxWidth = log2Ceil(NumUseAltOnNa)
-    pc(useAltOnNaIdxWidth - 1 + instOffsetBits, instOffsetBits)
-  }
 }
 
-trait TableHelper extends TopHelper { // extends TopHelper for getBankIndex
+trait TableHelper extends TopHelper {
   // varies between different tables
   implicit val info: TageTableInfo
 
@@ -58,8 +55,8 @@ trait TableHelper extends TopHelper { // extends TopHelper for getBankIndex
     maxWidth = Option(VAddrBits)
   )
 
-  def getBankIndex(pc: PrunedAddr): UInt =
-    addrFields.extract("bankIdx", pc)
+  def getBankIndex(pc: PrunedAddr, hist: UInt): UInt =
+    addrFields.extract("bankIdx", pc) ^ hist
 
   def getSetIndex(pc: PrunedAddr, hist: UInt): UInt =
     addrFields.extract("setIdx", pc) ^ hist

@@ -23,7 +23,8 @@ import utils._
 import utility._
 import xiangshan._
 import xiangshan.ExceptionNO._
-import xiangshan.backend.rob.{RobPtr, RobLsqIO}
+import xiangshan.backend.rob.RobPtr
+import xiangshan.backend.rob.Rob.RobLsqIO
 import xiangshan.backend.Bundles
 import xiangshan.backend.Bundles.{DynInst, MemExuOutput}
 import xiangshan.backend.fu.FuConfig.LduCfg
@@ -72,6 +73,7 @@ class UncacheEntry(entryIndex: Int)(implicit p: Parameters) extends XSModule
   val uncacheData = Reg(io.uncache.resp.bits.data.cloneType)
   val nderr = RegInit(false.B)
   val derr = RegInit(false.B)
+  val respAccept = RegInit(false.B)
 
   val writeback = Mux(req.nc, io.ncOut.fire, io.mmioOut.fire)
   val slaveAck = req_valid && io.uncache.idResp.valid && io.uncache.idResp.bits.mid === entryIndex.U
@@ -122,7 +124,7 @@ class UncacheEntry(entryIndex: Int)(implicit p: Parameters) extends XSModule
   val pendingPtr = GatedRegNext(io.rob.pendingPtr)
   val canSendReq = req_valid && !needFlush && Mux(
     req.nc, true.B,
-    req.uop.robIdx === pendingPtr
+    req.uop.robIdx.isNotAfterSlot(pendingPtr)
   )
   switch (uncacheState) {
     is (s_idle) {
@@ -190,10 +192,16 @@ class UncacheEntry(entryIndex: Int)(implicit p: Parameters) extends XSModule
   io.uncache.resp.ready := true.B
 
   /* uncache resp */
-  when (io.uncache.resp.fire) {
+  when (io.uncache.resp.fire && !respAccept) {
     uncacheData := io.uncache.resp.bits.data
     nderr := io.uncache.resp.bits.nderr
     derr := io.uncache.resp.bits.error
+  }
+
+  when(needFlush || writeback) {
+    respAccept := false.B
+  }.elsewhen(io.uncache.resp.fire && !needFlushReg && !needFlush) {
+    respAccept := true.B
   }
 
   /* uncache writeback */
@@ -204,7 +212,7 @@ class UncacheEntry(entryIndex: Int)(implicit p: Parameters) extends XSModule
   io.ncOut.bits := DontCare
 
   when(req.nc){
-    io.ncOut.valid := (uncacheState === s_wait) && !needFlush
+    io.ncOut.valid := (uncacheState === s_wait) // we will be flush in loadUnit s1, don't need to flush in s0.
     io.ncOut.bits := DontCare
     io.ncOut.bits.uop := req.uop
     io.ncOut.bits.uop.lqIdx := req.uop.lqIdx
@@ -213,7 +221,7 @@ class UncacheEntry(entryIndex: Int)(implicit p: Parameters) extends XSModule
     io.ncOut.bits.data := uncacheData
     io.ncOut.bits.paddr := req.paddr
   }.otherwise{
-    io.mmioOut.valid := (uncacheState === s_wait) && !needFlush
+    io.mmioOut.valid := (uncacheState === s_wait) // we will be flush in loadUnit s1, don't need to flush in s0.
     io.mmioOut.bits := DontCare
     io.mmioOut.bits.uop := req.uop
     io.mmioOut.bits.uop.lqIdx := req.uop.lqIdx
@@ -228,15 +236,15 @@ class UncacheEntry(entryIndex: Int)(implicit p: Parameters) extends XSModule
     io.mmioRawData.uop := req.uop
     io.mmioRawData.addrOffset := req.paddr
   }
-  io.ncWakeup.valid := uncacheState === s_wakeup && req.nc && !needFlush && !needFlushReg
+  io.ncWakeup.valid := uncacheState === s_wakeup && req.nc && !needFlushReg
   io.ncWakeup.bits := req.uop.lqIdx
-  io.mmioWakeup.valid := uncacheState === s_wakeup && req.mmio && !needFlush && !needFlushReg
+  io.mmioWakeup.valid := uncacheState === s_wakeup && req.mmio && !needFlushReg
   io.mmioWakeup.bits := req.uop.lqIdx
 
-  io.exception.valid := writeback
-  io.exception.bits := req
-  io.exception.bits.uop.exceptionVec(loadAccessFault) := nderr
-  io.exception.bits.uop.exceptionVec(hardwareError) := derr
+  io.exception.valid := RegNext(writeback)
+  io.exception.bits := RegEnable(req, writeback)
+  io.exception.bits.uop.exceptionVec(loadAccessFault) := RegEnable(nderr, writeback)
+  io.exception.bits.uop.exceptionVec(hardwareError) := RegEnable(derr, writeback)
 
   /* debug log */
   XSDebug(io.uncache.req.fire,
@@ -332,7 +340,9 @@ class LoadQueueUncache(implicit p: Parameters) extends XSModule
    *    ready: freelist can allocate
    ******************************************************************/
 
-  val s1_sortedVec = HwSort(VecInit(io.req.map { case x => DataWithPtr(x.valid, x.bits, x.bits.uop.robIdx) }))
+  val s1_sortedVec = HwSort(
+    VecInit(io.req.map { case x => DataWithPtr(x.valid, x.bits, x.bits.uop.robIdx) })
+  )((a, b) => a.isBeforeSlot(b))
   val s1_req = VecInit(s1_sortedVec.map(_.bits))
   val s1_valid = VecInit(s1_sortedVec.map(_.valid))
   val s2_enqueue = Wire(Vec(LoadPipelineWidth, Bool()))
@@ -482,7 +492,7 @@ class LoadQueueUncache(implicit p: Parameters) extends XSModule
 
   /******************************************************************
    * Forward Logic
-   * 
+   *
    * s1 response paddr, s2 response forwardData
    ******************************************************************/
 
@@ -600,10 +610,10 @@ class LoadQueueUncache(implicit p: Parameters) extends XSModule
     redirect.bits             := DontCare
     redirect.bits.isRVC       := reqSelUops(i).isRVC
     redirect.bits.robIdx      := reqSelUops(i).robIdx
+    redirect.bits.satpFlush   := false.B
     redirect.bits.ftqIdx      := reqSelUops(i).ftqPtr
     redirect.bits.ftqOffset   := reqSelUops(i).ftqOffset
     redirect.bits.level       := RedirectLevel.flush
-    redirect.bits.target      := reqSelUops(i).pc // TODO: check if need pc
     redirect.bits.debug_runahead_checkpoint_id := reqSelUops(i).perfDebugInfo.runahead_checkpoint_id
     redirect
   })

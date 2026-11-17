@@ -19,14 +19,14 @@ package xiangshan
 import chisel3._
 import chisel3.util._
 import org.chipsalliance.cde.config._
-import chisel3.util.{Valid, ValidIO}
+import chisel3.util.{Valid, ValidIO, log2Up}
 import freechips.rocketchip.devices.debug.DebugModuleKey
 import freechips.rocketchip.diplomacy._
 import freechips.rocketchip.interrupts._
 import freechips.rocketchip.tile.{BusErrorUnit, BusErrorUnitParams, BusErrors, MaxHartIdBits}
 import freechips.rocketchip.tilelink._
-import xscache.coupledL2.{L2ParamKey, PrefetchCtrlFromCore}
-import xscache.chi.{CHIIssue, CHIAddrWidthKey, NonSecureKey, PortIO}
+import xscache.coupledL2.{EnableL2DecoupledDownstreamCHI, L2ParamKey, L2ToL1PfCtrl, PrefetchCtrlFromCore}
+import xscache.chi.{CHIDataCheckKey, CHIIssue, CHIAddrWidthKey, CHIPoisonKey, DecoupledPortIO, NonSecureKey, PortIO}
 import xscache.coupledL2.CoupledL2
 import xscache.common.BankBitsKey
 import system.HasSoCParameter
@@ -75,7 +75,13 @@ class L2TopInlined()(implicit p: Parameters) extends LazyModule
   }
   val enableL2 = coreParams.L2CacheParamsOpt.isDefined
   // =========== Components ============
-  val l1_xbar = TLXbar()
+  private val specMissEnabled = coreParams.dcacheParametersOpt.exists(_.enMissTrack)
+  val l1_l2_fabric = LazyModule(new CustomL1L2Fabric(
+    specChannels = if (specMissEnabled) numMemChannelsFromDcache else 0,
+    specOwners = if (specMissEnabled) LoadPipelineWidth else 0,
+    specIdBits = if (specMissEnabled) log2Up(dcacheParameters.nMissEntries) else 0,
+    specBlockBytes = if (specMissEnabled) dcacheParameters.blockBytes else 0
+  ))
   val mmio_xbar = TLXbar()
   val mmio_port = TLIdentityNode() // to L3
   val memory_port = if (enableL2) None else Some(TLIdentityNode())
@@ -90,7 +96,6 @@ class L2TopInlined()(implicit p: Parameters) extends LazyModule
   val sep_tl_port_opt = Option.when(SeperateBus != top.SeperatedBusType.NONE)(TLTempNode())
 
   val misc_l2_pmu = BusPerfMonitor(name = "Misc_L2", enable = !debugOpts.FPGAPlatform) // l1D & l1I & PTW
-  val xbar_l2_buffer = TLBuffer()
 
   val enbale_tllog = !debugOpts.FPGAPlatform && debugOpts.AlwaysBasicDB
   val l1d_logger = Seq.tabulate(numMemChannelsFromDcache)(i =>
@@ -108,7 +113,6 @@ class L2TopInlined()(implicit p: Parameters) extends LazyModule
   val beu_local_int_source = IntSourceNode(IntSourcePortSimple())
   val beu_local_int_source_buffer = IntBuffer()
 
-  println(s"enableCHI: ${enableCHI}")
   val l2cache = if (enableL2) {
     val sliceCoherentClientMap =
       if (coreParams.dcacheParametersOpt.exists(p => p.numMemChannels == 2 && p.channelSelByAddr) &&
@@ -128,6 +132,9 @@ class L2TopInlined()(implicit p: Parameters) extends LazyModule
       case CHIIssue => p(CHIIssue)
       case CHIAddrWidthKey => p(CHIAddrWidthKey)
       case NonSecureKey => p(NonSecureKey)
+      case CHIDataCheckKey if isZhuJiang => "none"
+      case CHIPoisonKey if isZhuJiang => false
+      case EnableL2DecoupledDownstreamCHI => isZhuJiang
       case BankBitsKey => log2Ceil(coreParams.L2NBanks)
       case MaxHartIdBits => p(MaxHartIdBits)
       case LogUtilsOptionsKey => p(LogUtilsOptionsKey)
@@ -141,11 +148,11 @@ class L2TopInlined()(implicit p: Parameters) extends LazyModule
   // l2 to l2_binder, then to memory_port
   l2cache match {
     case Some(l2) =>
-      l2_binder.get :*= l2.node :*= xbar_l2_buffer :*= l1_xbar :=* misc_l2_pmu
+      l2_binder.get :*= l2.node :*= l1_l2_fabric.node :=* misc_l2_pmu
       l2.managerNode := TLXbar() :=* l2_binder.get
       l2.mmioNode := mmio_port
     case None =>
-      memory_port.get := l1_xbar
+      memory_port.get := l1_l2_fabric.node
   }
 
   mmio_xbar := TLBuffer.chainNode(2) := i_mmio_port
@@ -178,6 +185,10 @@ class L2TopInlined()(implicit p: Parameters) extends LazyModule
         val fromTile = Input(UInt(PAddrBits.W))
         val toCore = Output(UInt(PAddrBits.W))
       }
+      val reset_mtvec = Option.when(enableResetMtvec)(new Bundle {
+        val fromTile = Input(UInt(PAddrBits.W))
+        val toCore = Output(UInt(PAddrBits.W))
+      })
       val hartId = new Bundle() {
         val fromTile = Input(UInt(64.W))
         val toCore = Output(UInt(64.W))
@@ -228,12 +239,14 @@ class L2TopInlined()(implicit p: Parameters) extends LazyModule
         val fromTile = Input(ValidIO(UInt(64.W)))
         val toCore = Output(ValidIO(UInt(64.W)))
       }
-      val chi = if (enableCHI) Some(new PortIO) else None
-      val nodeID = if (enableCHI) Some(Input(UInt(NodeIDWidth.W))) else None
+      val chi = Option.when(isOpenLLC)(new PortIO)
+      val decoupledCHI = Option.when(isZhuJiang)(new DecoupledPortIO)
+      val nodeID = Some(Input(UInt(NodeIDWidth.W)))
       val pfCtrlFromCore = Input(new PrefetchCtrlFromCore)
       val l2_tlb_req = new TlbRequestIO(nRespDups = 2)
       val l2_pmp_resp = Flipped(new PMPRespBundle)
       val l2_hint = Vec(numMemChannelsFromDcache, ValidIO(new L2ToL1Hint()))
+      val l2_fdbk_pf_ctrl = Output(new L2ToL1PfCtrl)
       val perfEvents = Output(Vec(numPCntHc * coreParams.L2NBanks + 1, new PerfEvent))
       val l2_flush_en = Option.when(EnablePowerDown) (Input(Bool()))
       val l2_flush_done = Option.when(EnablePowerDown) (Output(Bool()))
@@ -247,6 +260,9 @@ class L2TopInlined()(implicit p: Parameters) extends LazyModule
     io.dft_reset_out.zip(io.dft_reset).foreach({ case(a, b) => a := b })
 
     val resetDelayN = Module(new DelayN(UInt(PAddrBits.W), 5))
+    io.reset_mtvec.foreach{ mtvec =>
+      mtvec.toCore := mtvec.fromTile
+    }
 
     val (beu_int_out, _) = beu_local_int_source.out(0)
     beu_int_out(0) := beu.module.io.interrupt
@@ -265,7 +281,7 @@ class L2TopInlined()(implicit p: Parameters) extends LazyModule
       teemsiInfo.toCore.bits := RegEnable(teemsiInfo.fromTile.bits, teemsiInfo.fromTile.valid)
     }
     io.cpu_wfi.toTile := RegNext(io.cpu_wfi.fromCore)
-    io.cpu_critical_error.toTile := RegNext(io.cpu_critical_error.fromCore)
+    io.cpu_critical_error.toTile := RegNext(io.cpu_critical_error.fromCore, false.B)
     io.msiAck.toTile := io.msiAck.fromCore
     io.teemsiAck.foreach( teemsiAck => teemsiAck.toTile := teemsiAck.fromCore)
     io.l3Miss.toCore := RegNext(io.l3Miss.fromTile)
@@ -284,7 +300,7 @@ class L2TopInlined()(implicit p: Parameters) extends LazyModule
     )
     traceToTile.toEncoder.mstatus := RegNext(traceFromCore.toEncoder.mstatus)
     (0 until TraceGroupNum).foreach{ i =>
-      traceToTile.toEncoder.groups(i).valid := RegNext(traceFromCore.toEncoder.groups(i).valid)
+      traceToTile.toEncoder.groups(i).valid := RegNext(traceFromCore.toEncoder.groups(i).valid, false.B)
       traceToTile.toEncoder.groups(i).bits.iretire := RegNext(traceFromCore.toEncoder.groups(i).bits.iretire)
       traceToTile.toEncoder.groups(i).bits.itype := RegNext(traceFromCore.toEncoder.groups(i).bits.itype)
       traceToTile.toEncoder.groups(i).bits.ilastsize := RegEnable(
@@ -313,6 +329,7 @@ class L2TopInlined()(implicit p: Parameters) extends LazyModule
       l2.io.dft.zip(io.dft).foreach({ case(a, b) => a := b })
       l2.io.dft_reset.zip(io.dft_reset).foreach({ case(a, b) => a := b })
       io.l2_hint := l2.io.l2_hint
+      io.l2_fdbk_pf_ctrl := l2.io.l2_fdbk_pf_ctrl
       l2.io.debugTopDown.robHeadPaddr := DontCare
       l2.io.hartId := io.hartId.fromTile
       l2.io.debugTopDown.robHeadPaddr := io.debugTopDown.robHeadPaddr
@@ -359,7 +376,11 @@ class L2TopInlined()(implicit p: Parameters) extends LazyModule
         case l2cache: CoupledL2 =>
           val l2 = l2cache.module
           l2.io.nodeID := io.nodeID.get
-          io.chi.get <> l2.io.chi
+          if (isOpenLLC) {
+            io.chi.get <> l2.io.lcreditCHI.get
+          } else {
+            io.decoupledCHI.get <> l2.io.decoupledCHI.get
+          }
           l2.io.cpu_wfi.foreach { _ := io.cpu_wfi.fromCore }
       }
 
@@ -367,6 +388,7 @@ class L2TopInlined()(implicit p: Parameters) extends LazyModule
       beu.module.io.errors.l2.ecc_error.bits := l2.io.error.address
     } else {
       io.l2_hint := 0.U.asTypeOf(io.l2_hint)
+      io.l2_fdbk_pf_ctrl := L2ToL1PfCtrl.default()
       io.debugTopDown <> DontCare
       io.l2Miss := false.B
 

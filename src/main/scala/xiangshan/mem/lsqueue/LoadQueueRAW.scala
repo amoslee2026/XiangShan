@@ -85,7 +85,7 @@ class LoadQueueRAW(implicit p: Parameters) extends XSModule
     val pc = UInt(VAddrBits.W)
     val debugInfo = new PerfDebugInfo
   }
-  private def isOlder(left: UopEntry, right: UopEntry): Bool = isBefore(left.robIdx, right.robIdx)
+  private def isOlder(left: UopEntry, right: UopEntry): Bool = left.robIdx.isBeforeSlot(right.robIdx)
   val allocated = RegInit(VecInit(List.fill(LoadQueueRAWSize)(false.B))) // The control signals need to explicitly indicate the initial value
   val uop = Reg(Vec(LoadQueueRAWSize, new UopEntry))
   val paddrModule = Module(new LqPAddrModule(
@@ -326,7 +326,7 @@ class LoadQueueRAW(implicit p: Parameters) extends XSModule
 
     val addrMaskMatch = paddrModule.io.violationMmask(i).asUInt & maskModule.io.violationMmask(i).asUInt
     val entryNeedCheck = GatedValidRegNext(VecInit((0 until LoadQueueRAWSize).map(j => {
-      allocated(j) && storeIn(i).valid && isAfter(uop(j).robIdx, storeIn(i).bits.uop.robIdx) && datavalid(j) && !uop(j).robIdx.needFlush(io.redirect) && !willRevoke(j)
+      allocated(j) && storeIn(i).valid && uop(j).robIdx.isAfterSlot(storeIn(i).bits.uop.robIdx) && datavalid(j) && !uop(j).robIdx.needFlush(io.redirect) && !willRevoke(j)
     })))
     val lqViolationSelVec = VecInit((0 until LoadQueueRAWSize).map(j => {
       addrMaskMatch(j) && entryNeedCheck(j)
@@ -382,11 +382,11 @@ class LoadQueueRAW(implicit p: Parameters) extends XSModule
     redirect.bits.robIdx      := rollbackLqWb(i).bits.robIdx
     redirect.bits.ftqIdx      := rollbackLqWb(i).bits.ftqPtr
     redirect.bits.ftqOffset   := rollbackLqWb(i).bits.ftqOffset
+    redirect.bits.satpFlush   := false.B
     redirect.bits.stIsRVC     := stIsRVC(i)
     redirect.bits.stFtqIdx    := stFtqIdx(i)
     redirect.bits.stFtqOffset := stFtqOffset(i)
     redirect.bits.level       := RedirectLevel.flush
-    redirect.bits.target      := rollbackLqWb(i).bits.pc
     redirect.bits.debug_runahead_checkpoint_id := rollbackLqWb(i).bits.debugInfo.runahead_checkpoint_id
     redirect
   })

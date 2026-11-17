@@ -20,7 +20,7 @@ import chisel3.util._
 import org.chipsalliance.cde.config.Parameters
 import xiangshan.XSBundle
 import xiangshan.XSModule
-import xiangshan.frontend.PrunedAddr
+import xiangshan.frontend.GuardedPc
 
 abstract class BpuBundle(implicit p: Parameters) extends XSBundle with HasBpuParameters
 
@@ -36,7 +36,7 @@ abstract class BasePredictorIO(implicit p: Parameters) extends BpuBundle {
   // predict stage control
   val stageCtrl: StageCtrl = Input(new StageCtrl)
   // predict request
-  val startPc: PrunedAddr = Input(PrunedAddr(VAddrBits))
+  val startPc: GuardedPc = Input(GuardedPc())
   // resolve train
   val trainReady: Bool  = Output(Bool())
   val train:      Train = Input(new Train)
@@ -46,6 +46,14 @@ abstract class BasePredictorIO(implicit p: Parameters) extends BpuBundle {
   val sramResetDone: Bool = Output(Bool())
 }
 
+trait HasAheadPredictorIO extends BasePredictorIO {
+  val redirect:        Bool      = Input(Bool())
+  val bpuS2Override:   Bool      = Input(Bool())
+  val bpuS3Override:   Bool      = Input(Bool())
+  val newStartPc:      GuardedPc = Input(GuardedPc())
+  val overrideStartPc: GuardedPc = Input(GuardedPc())
+}
+
 trait HasFastTrainIO extends BasePredictorIO {
   override val fastTrain: Option[Valid[FastTrain]] = Option(Input(Valid(new FastTrain)))
 }
@@ -53,9 +61,10 @@ trait HasFastTrainIO extends BasePredictorIO {
 // The abstract class is used to abstract the setIdx and tag from write requests for updating write buffer entries
 abstract class WriteReqBundle(implicit p: Parameters) extends BpuBundle {
   val setIdx: UInt
-  val wayMask: Option[Vec[Bool]]       = None
-  val wayData: Option[Vec[UInt]]       = None
-  def tag:     Option[UInt]            = None
-  def cnt:     Option[SaturateCounter] = None
-  def taken:   Option[Bool]            = None
+  val wayMask:     Option[Vec[Bool]]       = None
+  val wayData:     Option[Vec[UInt]]       = None
+  def tag:         Option[UInt]            = None
+  def cnt:         Option[SaturateCounter] = None
+  def taken:       Option[Bool]            = None
+  def compareBits: Option[UInt]            = None
 }

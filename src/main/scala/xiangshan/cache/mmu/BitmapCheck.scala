@@ -122,7 +122,7 @@ class Bitmap(implicit p: Parameters) extends XSModule with HasPtwConst {
 
   val csr = io.csr
   val sfence = io.sfence
-  val flush = sfence.valid || csr.satp.changed || csr.vsatp.changed || csr.hgatp.changed || csr.priv.virt_changed
+  val flush = sfence.valid || csr.satp.changed || csr.vsatp.changed || csr.hgatp.changed || csr.priv.virtChanged
   val bitmap_base = csr.mbmc.BMA << 6
 
   val entries = RegInit(VecInit(Seq.fill(l2tlbParams.llptwsize+2)(0.U.asTypeOf(new bitmapEntry()))))
@@ -145,13 +145,7 @@ class Bitmap(implicit p: Parameters) extends XSModule with HasPtwConst {
   val mem_arb = Module(new RRArbiterInit(new bitmapEntry(), l2tlbParams.llptwsize+2))
 
   val bitmapdata = Wire(Vec(blockBits / XLEN, UInt(XLEN.W)))
-  if (HasBitmapCheckDefault) {
-    for (i <- 0 until blockBits / XLEN) {
-      bitmapdata(i) := 0.U
-    }
-  } else {
-    bitmapdata := io.mem.resp.bits.value.asTypeOf(Vec(blockBits / XLEN, UInt(XLEN.W)))
-  }
+  bitmapdata := io.mem.resp.bits.value.asTypeOf(Vec(blockBits / XLEN, UInt(XLEN.W)))
 
   for (i <- 0 until l2tlbParams.llptwsize+2) {
     mem_arb.io.in(i).bits := entries(i)
@@ -409,7 +403,7 @@ class BitmapCache(implicit p: Parameters) extends XSModule with HasPtwConst {
 
   val csr = io.csr
   val sfence = io.sfence
-  val flush = sfence.valid || csr.satp.changed || csr.vsatp.changed || csr.hgatp.changed || csr.priv.virt_changed
+  val flush = sfence.valid || csr.satp.changed || csr.vsatp.changed || csr.hgatp.changed || csr.priv.virtChanged
   val bitmap_cache_clear = csr.mbmc.BCLEAR
 
   val bitmapCacheEntryType = new bitmapCacheEntry(ReservedBits = l2tlbParams.bcReservedBits)

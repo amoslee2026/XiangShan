@@ -21,6 +21,8 @@ import freechips.rocketchip.util.SeqToAugmentedSeq
 import org.chipsalliance.cde.config.Parameters
 import utility.ChiselDB
 import utility.DataHoldBypass
+import utility.ParallelORR
+import utility.ParallelPriorityMux
 import utility.XSPerfAccumulate
 import utility.XSPerfHistogram
 import xiangshan.frontend.bpu.BasePredictor
@@ -33,11 +35,11 @@ import xiangshan.frontend.bpu.TageTableInfo
  */
 class Tage(implicit p: Parameters) extends BasePredictor with HasTageParameters with TopHelper with HalfAlignHelper {
   class TageIO(implicit p: Parameters) extends BasePredictorIO {
-    val fromPhr:     PhrToTageIO         = new PhrToTageIO
-    val fromMainBtb: MainBtbToTageIO     = new MainBtbToTageIO
-    val toSc:        TageToScIO          = new TageToScIO
-    val prediction:  Vec[TagePrediction] = Output(Vec(NumBtbResultEntries, new TagePrediction))
-    val meta:        TageMeta            = Output(new TageMeta)
+    val fromPhr:     PhrToTageIO     = new PhrToTageIO
+    val fromMainBtb: MainBtbToTageIO = new MainBtbToTageIO
+    val toSc:        TageToScIO      = new TageToScIO
+    val prediction:  TagePrediction  = Output(new TagePrediction)
+    val meta:        TageMeta        = Output(new TageMeta)
 
     val debug_trainValid: Bool = Input(Bool())
   }
@@ -51,7 +53,7 @@ class Tage(implicit p: Parameters) extends BasePredictor with HasTageParameters 
   private val usefulResetInFlight = RegInit(false.B)
 
   // use the alternate prediction when counter is positive
-  private val useAltOnNaVec = RegInit(VecInit.fill(NumUseAltOnNa)(UseAltOnNaCounter.Zero))
+  private val useAltOnNaVec = RegInit(VecInit.fill(NumUseAltOnNa)(UseAltOnNaCounter.WeakPositive))
 
   /* *** reset *** */
   io.sramResetDone := tables.map(_.io.sramResetDone).reduce(_ && _)
@@ -62,104 +64,132 @@ class Tage(implicit p: Parameters) extends BasePredictor with HasTageParameters 
      -------------------------------------------------------------------------------------------------------------- */
 
   private val s0_fire    = io.stageCtrl.s0_fire && io.enable
-  private val s0_startPc = io.startPc
+  private val s0_startPc = io.startPc.unGuard
 
   private val s0_foldedHist = getFoldedHist(io.fromPhr.foldedPathHist)
   private val s0_setIdx = VecInit((tables zip s0_foldedHist).map { case (table, hist) =>
-    table.getSetIndex(s0_startPc, hist.forIdx)
+    table.getSetIndex(s0_startPc, hist.forSetIdx)
   })
 
-  // currently all tables share the same bank index
-  private val s0_bankIdx  = tables.head.getBankIndex(s0_startPc)
-  private val s0_bankMask = UIntToOH(s0_bankIdx, NumBanks)
+  private val s0_bankIdx = VecInit((tables zip s0_foldedHist).map { case (table, hist) =>
+    table.getBankIndex(s0_startPc, hist.forBankIdx)
+  })
+  private val s0_bankMask = VecInit(s0_bankIdx.map(UIntToOH(_, NumBanks)))
 
   tables.zipWithIndex.foreach { case (table, tableIdx) =>
     table.io.readReq(0).valid         := s0_fire
     table.io.readReq(0).bits.setIdx   := s0_setIdx(tableIdx)
-    table.io.readReq(0).bits.bankMask := s0_bankMask
+    table.io.readReq(0).bits.bankMask := s0_bankMask(tableIdx)
   }
 
   /* --------------------------------------------------------------------------------------------------------------
      predict pipeline stage 1
      - get read resp from tables
-     - compute tag
+     - compute tags
      -------------------------------------------------------------------------------------------------------------- */
 
-  private val s1_fire       = io.stageCtrl.s1_fire
+  private val s1_fire       = io.stageCtrl.s1_fire && io.enable
   private val s1_startPc    = RegEnable(s0_startPc, s0_fire)
   private val s1_foldedHist = RegEnable(s0_foldedHist, s0_fire)
 
-  // Vec[NumBtbResultEntries][NumTables]
-  private val s1_tag = VecInit(io.fromMainBtb.s1_positions.map { position =>
-    VecInit((tables zip s1_foldedHist).map { case (table, hist) =>
+  private val s1_readResp = DataHoldBypass(VecInit(tables.map(_.io.readResp(0))), RegNext(s0_fire))
+
+  private val s1_tags = VecInit(io.fromMainBtb.s1_positions.map { position =>
+    VecInit(tables.zip(s1_foldedHist).map { case (table, hist) =>
       table.getTag(s1_startPc, hist.forTag, position)
     })
   })
 
-  private val s1_readResp = DataHoldBypass(VecInit(tables.map(_.io.readResp(0))), RegNext(s0_fire))
+  private val s1_hits = VecInit(s1_tags.map { branchTags =>
+    VecInit(s1_readResp.zip(branchTags).map { case (tableReadResp, tag) =>
+      tableReadResp.entries.map(entry => entry.valid && entry.tag === tag).asUInt
+    })
+  })
 
   /* --------------------------------------------------------------------------------------------------------------
      predict pipeline stage 2
      - get results from mbtb
-     - get prediction for each branch
+     - generate the fast provider candidate for each table way
+     - select the hit way and provider
+     - select the alternate and complete the prediction for each branch
      -------------------------------------------------------------------------------------------------------------- */
 
-  private val s2_fire     = io.stageCtrl.s2_fire
-  private val s2_startPc  = RegEnable(s1_startPc, s1_fire)
-  private val s2_tag      = RegEnable(s1_tag, s1_fire)
+  private val s2_fire     = io.stageCtrl.s2_fire && io.enable
   private val s2_readResp = RegEnable(s1_readResp, s1_fire)
-
+  private val s2_hits     = RegEnable(s1_hits, s1_fire)
   private val s2_branches = io.fromMainBtb.result
 
-  s2_branches.zipWithIndex.foreach { case (branch, i) =>
-    val position      = branch.bits.cfiPosition
-    val cfiPc         = getCfiPcFromPosition(s2_startPc, position)
-    val useAltOnNaIdx = getUseAltOnNaIdx(cfiPc)
-    val useAltOnNa    = useAltOnNaVec(useAltOnNaIdx).isPositive
+  s2_branches.indices.foreach { branchIdx =>
+    val candidates = TableInfos.indices.reverse.flatMap { tableIdx =>
+      (0 until TableInfos(tableIdx).NumWays).map { wayIdx =>
+        val hit   = s2_hits(branchIdx)(tableIdx)(wayIdx)
+        val taken = s2_readResp(tableIdx).entries(wayIdx).takenCtr.isPositive
+        hit -> taken
+      }
+    }
+    io.prediction.fastTakenVec(branchIdx).valid := ParallelORR(candidates.map(_._1))
+    io.prediction.fastTakenVec(branchIdx).bits  := ParallelPriorityMux(candidates)
+  }
 
-    // compare tags of each branch with all tables
+  s2_branches.zipWithIndex.foreach { case (branch, i) =>
     val allTableTagMatchResults = s2_readResp.zipWithIndex.map { case (tableReadResp, tableIdx) =>
-      val tag          = s2_tag(i)(tableIdx)
-      val hitWayMask   = tableReadResp.entries.map(entry => entry.valid && entry.tag === tag)
+      val hitWayMask   = s2_hits(i)(tableIdx)
       val hitWayMaskOH = PriorityEncoderOH(hitWayMask)
 
-      val result = Wire(new PredictTagMatchResult).suggestName(s"s2_branch_${i}_table_${tableIdx}_result")
-      result.hit          := hitWayMask.reduce(_ || _)
+      val result = Wire(new PredictTagMatchResult)
+      result.hit          := hitWayMask.orR
       result.hitWayMaskOH := hitWayMaskOH.asUInt
       result.takenCtr     := Mux1H(hitWayMaskOH, tableReadResp.entries.map(_.takenCtr))
       result.usefulCtr    := Mux1H(hitWayMaskOH, tableReadResp.usefulCtrs)
       result.hitWayMask   := hitWayMask.asUInt
       result
     }
+
     // find the provider, the table with the longest history among the hit tables
-    val hitTableMask    = allTableTagMatchResults.map(_.hit)
-    val hasProvider     = hitTableMask.reduce(_ || _)
-    val providerTableOH = getLongestHistTableOH(hitTableMask)
-    val provider        = Mux1H(providerTableOH, allTableTagMatchResults)
+    val hitTableMask = VecInit(allTableTagMatchResults.map(_.hit)).asUInt
+    val hasProvider  = ParallelORR(hitTableMask)
+    val providerTableOH = ParallelPriorityMux(
+      allTableTagMatchResults.zipWithIndex.reverse.map { case (result, tableIdx) =>
+        result.hit -> UIntToOH(tableIdx.U, NumTables)
+      }
+    )
+    val provider = ParallelPriorityMux(
+      allTableTagMatchResults.reverse.map(result => result.hit -> result)
+    )
 
     // find the alt, the table with the second longest history among the hit tables
-    val hitTableMaskNoProvider = hitTableMask.zip(providerTableOH).map { case (a, b) => a && !b }
-    val hasAlt                 = hasProvider && hitTableMaskNoProvider.reduce(_ || _)
-    val altTableOH             = getLongestHistTableOH(hitTableMaskNoProvider)
-    val alt                    = Mux1H(altTableOH, allTableTagMatchResults)
+    val hitTableMaskNoProvider = hitTableMask & (~providerTableOH)
+    val hasAlt                 = hasProvider && ParallelORR(hitTableMaskNoProvider)
+    val altTableOH             = getLongestHistTableOH(hitTableMaskNoProvider.asBools).asUInt
+    val alt = ParallelPriorityMux(
+      hitTableMaskNoProvider.asBools.zip(allTableTagMatchResults).reverse
+    )
 
+    val altConf          = Mux(hasAlt, !alt.takenCtr.isWeak, io.fromMainBtb.baseConf(i))
+    val providerTableIdx = OHToUInt(providerTableOH)
+    val useAltOnNaIdx    = Cat(providerTableIdx, altConf)
+    val useAltOnNa       = useAltOnNaVec(useAltOnNaIdx).isPositive
+
+    // If the entry is recognized as a newly allocated entry and USE_ALT_ON_NA is positive,
+    // use the alternate prediction.
     val useProvider = hasProvider && !(useAltOnNa && provider.takenCtr.isWeak)
 
-    // get prediction for each branch
-    io.prediction(i).useProvider  := useProvider
-    io.prediction(i).providerPred := provider.takenCtr.isPositive
-    io.prediction(i).hasAlt       := hasAlt
-    io.prediction(i).altPred      := alt.takenCtr.isPositive
+    io.prediction.takenVec(i).valid := (useProvider || hasAlt) && io.enable
+    io.prediction.takenVec(i).bits  := Mux(useProvider, provider.takenCtr.isPositive, alt.takenCtr.isPositive)
 
-    io.toSc.providerTakenCtrVec(i).valid := hasProvider && branch.valid
+    io.toSc.providerTakenCtrVec(i).valid := (hasProvider && branch.valid) && io.enable
     io.toSc.providerTakenCtrVec(i).bits  := provider.takenCtr
 
     io.meta.entries(i).useProvider       := useProvider
-    io.meta.entries(i).providerTableIdx  := OHToUInt(providerTableOH)
+    io.meta.entries(i).hasProvider       := hasProvider
+    io.meta.entries(i).hasAlt            := hasAlt
+    io.meta.entries(i).providerTableIdx  := providerTableIdx
     io.meta.entries(i).providerWayIdx    := OHToUInt(provider.hitWayMaskOH)
     io.meta.entries(i).providerTakenCtr  := provider.takenCtr
     io.meta.entries(i).providerUsefulCtr := provider.usefulCtr
-    io.meta.entries(i).altOrBasePred     := Mux(hasAlt, alt.takenCtr.isPositive, branch.bits.taken)
+    io.meta.entries(i).altTableIdx       := OHToUInt(altTableOH)
+    io.meta.entries(i).altWayIdx         := OHToUInt(alt.hitWayMaskOH)
+    io.meta.entries(i).altTakenCtr       := alt.takenCtr
 
     XSPerfAccumulate(
       s"s2_branch_${i}_multihit_on_same_table",
@@ -176,53 +206,66 @@ class Tage(implicit p: Parameters) extends BasePredictor with HasTageParameters 
   private val t0_startPc  = io.train.startPc
   private val t0_branches = io.train.branches
 
-  // currently all tables share the same bank index
-  private val t0_bankIdx  = tables.head.getBankIndex(t0_startPc)
-  private val t0_bankMask = UIntToOH(t0_bankIdx, NumBanks)
+  private val t0_foldedHist = getFoldedHist(io.fromPhr.foldedPathHistForTrain)
+  private val t0_bankIdx = VecInit((tables zip t0_foldedHist).map { case (table, hist) =>
+    table.getBankIndex(t0_startPc, hist.forBankIdx)
+  })
+  private val t0_bankMask = VecInit(t0_bankIdx.map(UIntToOH(_, NumBanks)))
 
   private val t0_condMask = VecInit(t0_branches.map(branch => branch.valid && branch.bits.attribute.isConditional))
   private val t0_hasCond  = t0_condMask.reduce(_ || _)
 
   private val t0_fire = io.stageCtrl.t0_fire && t0_hasCond && io.enable
 
-  private val (t0_mbtbHitMask, t0_basePred, t0_meta) = t0_branches.map { branch =>
+  private val (t0_mbtbHitMask, t0_baseCtr, t0_meta) = t0_branches.map { branch =>
     val mbtbMeta  = io.train.meta.mbtb.entries.flatten
     val tageMeta  = io.train.meta.tage.entries
     val hitMask   = mbtbMeta.map(_.hit(branch.bits))
     val hitMaskOH = PriorityEncoderOH(hitMask)
     val mbtbHit   = hitMask.reduce(_ || _)
-    val basePred  = Mux1H(hitMaskOH, mbtbMeta.map(_.counter.isPositive))
+    val baseCtr   = Mux1H(hitMaskOH, mbtbMeta.map(_.counter))
     val meta      = Mux1H(hitMaskOH, tageMeta)
-    (mbtbHit, basePred, meta)
+    (mbtbHit, baseCtr, meta)
   }.unzip3
 
-  // if all hit conditional branches use provider and no mispredict, use meta to train
-  private val t0_useMeta = t0_branches.zipWithIndex.map { case (branch, i) =>
-    val mbtbHit      = t0_mbtbHitMask(i)
-    val isCond       = t0_condMask(i)
-    val useProvider  = t0_meta(i).useProvider
-    val mispredicted = branch.bits.mispredict
-    !(mbtbHit && isCond) || (useProvider && !mispredicted)
-  }.reduce(_ && _)
-  private val t0_needRead = !t0_useMeta
+  // Meta stores provider and alternate state for training correct predictions.
+  // Re-read SRAM only on a misprediction to re-match entries and obtain allocation state.
+  private val t0_needRead = t0_branches.zipWithIndex.map { case (branch, i) =>
+    val mbtbHit = t0_mbtbHitMask(i)
+    val isCond  = t0_condMask(i)
+    val meta    = t0_meta(i)
+    val tagePred = MuxCase(
+      t0_baseCtr(i).isPositive,
+      Seq(
+        meta.useProvider -> meta.providerTakenCtr.isPositive,
+        meta.hasAlt      -> meta.altTakenCtr.isPositive
+      )
+    )
+    val tageMispredicted = tagePred =/= branch.bits.taken
+    val mispredicted     = branch.bits.mispredict
+    mbtbHit && isCond && (tageMispredicted || mispredicted)
+  }.reduce(_ || _)
+  private val t0_useMeta = !t0_needRead
 
-  private val t0_readBankConflict = t0_hasCond && t0_needRead && s0_fire && t0_bankIdx === s0_bankIdx
+  private val t0_readBankConflict = t0_needRead && s0_fire &&
+    t0_bankIdx.zip(s0_bankIdx).map { case (trainBank, predictBank) => trainBank === predictBank }.reduce(_ || _)
   io.trainReady := !t0_readBankConflict
 
   // t0_readBankConflict can be high even there's no train.valid, causing perf counters to be inaccurate
   // so we use a debug_ signal for perf counters
   private val debug_readBankConflict = io.debug_trainValid && t0_readBankConflict
+  private val debug_readBankNoConflict = io.debug_trainValid && t0_needRead && s0_fire &&
+    !t0_bankIdx.zip(s0_bankIdx).map { case (trainBank, predictBank) => trainBank === predictBank }.reduce(_ || _)
 
-  private val t0_foldedHist = getFoldedHist(io.fromPhr.foldedPathHistForTrain)
   private val t0_setIdx = VecInit((tables zip t0_foldedHist).map { case (table, hist) =>
-    table.getSetIndex(t0_startPc, hist.forIdx)
+    table.getSetIndex(t0_startPc, hist.forSetIdx)
   })
   dontTouch(t0_setIdx)
 
   tables.zipWithIndex.foreach { case (table, tableIdx) =>
     table.io.readReq(1).valid         := t0_fire && t0_needRead
     table.io.readReq(1).bits.setIdx   := t0_setIdx(tableIdx)
-    table.io.readReq(1).bits.bankMask := t0_bankMask
+    table.io.readReq(1).bits.bankMask := t0_bankMask(tableIdx)
   }
 
   // only for perf
@@ -235,7 +278,7 @@ class Tage(implicit p: Parameters) extends BasePredictor with HasTageParameters 
   private val debug_s1BankIdx               = RegEnable(s0_bankIdx, s0_fire)
   // pred target within align 64B,and not blocked by s2
   private val debug_readBankConflictShortLoop = debug_readBankConflictReg && s1_fire &&
-    (debug_s1BankIdx === s0_bankIdx) &&
+    debug_s1BankIdx.zip(s0_bankIdx).map { case (lastBank, bank) => lastBank === bank }.reduce(_ || _) &&
     (debug_s0AlignedPc.toUInt - debug_s1AlignedPc.toUInt <= FetchBlockSize.U ||
       debug_s1AlignedPc.toUInt - debug_s0AlignedPc.toUInt <= FetchBlockSize.U) && s0_fire
   private val debug_readBankConflictShortLoopReg = RegNext(debug_readBankConflictShortLoop)
@@ -273,7 +316,7 @@ class Tage(implicit p: Parameters) extends BasePredictor with HasTageParameters 
 
   private val t1_useMeta     = RegEnable(t0_useMeta, t0_fire)
   private val t1_meta        = RegEnable(VecInit(t0_meta), t0_fire)
-  private val t1_basePred    = RegEnable(VecInit(t0_basePred), t0_fire)
+  private val t1_baseCtr     = RegEnable(VecInit(t0_baseCtr), t0_fire)
   private val t1_mbtbHitMask = RegEnable(VecInit(t0_mbtbHitMask), t0_fire)
 
   private val t1_foldedHist = RegEnable(t0_foldedHist, t0_fire)
@@ -300,22 +343,15 @@ class Tage(implicit p: Parameters) extends BasePredictor with HasTageParameters 
 
   private val t2_useMeta     = RegEnable(t1_useMeta, t1_fire)
   private val t2_meta        = RegEnable(t1_meta, t1_fire)
-  private val t2_basePred    = RegEnable(t1_basePred, t1_fire)
+  private val t2_baseCtr     = RegEnable(t1_baseCtr, t1_fire)
   private val t2_mbtbHitMask = RegEnable(t1_mbtbHitMask, t1_fire)
 
-  private val t2_cfiUseAltOnNaIdxVec = VecInit(t2_branches.map { branch =>
-    val cfiPc = getCfiPcFromPosition(t2_startPc, branch.bits.cfiPosition)
-    getUseAltOnNaIdx(cfiPc)
-  })
-
   private val t2_trainInfoVec = VecInit(t2_branches.zipWithIndex.map { case (branch, i) =>
-    val isCond        = branch.valid && branch.bits.attribute.isConditional
-    val mbtbHit       = t2_mbtbHitMask(i)
-    val meta          = t2_meta(i)
-    val position      = branch.bits.cfiPosition
-    val actualTaken   = branch.bits.taken
-    val useAltOnNaIdx = t2_cfiUseAltOnNaIdxVec(i)
-    val useAltOnNa    = useAltOnNaVec(useAltOnNaIdx).isPositive
+    val isCond      = branch.valid && branch.bits.attribute.isConditional
+    val mbtbHit     = t2_mbtbHitMask(i)
+    val meta        = t2_meta(i)
+    val position    = branch.bits.cfiPosition
+    val actualTaken = branch.bits.taken
 
     val allTableTagMatchResults = t2_readResp.zipWithIndex.map { case (tableReadResp, tableIdx) =>
       val tag          = t2_rawTag(tableIdx) ^ position
@@ -347,22 +383,24 @@ class Tage(implicit p: Parameters) extends BasePredictor with HasTageParameters 
     val altOrBasePred = Wire(Bool())
 
     when(t2_useMeta) {
-      hasProvider     := true.B
-      providerTableOH := UIntToOH(meta.providerTableIdx, NumTables)
+      hasProvider     := meta.hasProvider
+      providerTableOH := Mux(meta.hasProvider, UIntToOH(meta.providerTableIdx, NumTables), 0.U)
 
-      provider.hit          := true.B
-      provider.hitWayMaskOH := UIntToOH(meta.providerWayIdx, MaxNumWays)
+      provider.hit          := meta.hasProvider
+      provider.hitWayMaskOH := Mux(meta.hasProvider, UIntToOH(meta.providerWayIdx, MaxNumWays), 0.U)
       provider.tag          := t2_rawTag(meta.providerTableIdx) ^ position
       provider.takenCtr     := meta.providerTakenCtr
       provider.usefulCtr    := meta.providerUsefulCtr
 
-      hasAlt     := false.B
-      altTableOH := 0.U
-      alt        := 0.U.asTypeOf(new TrainTagMatchResult)
+      hasAlt     := meta.hasAlt
+      altTableOH := Mux(meta.hasAlt, UIntToOH(meta.altTableIdx, NumTables), 0.U)
 
-      useProvider   := true.B
-      useAlt        := false.B
-      altOrBasePred := meta.altOrBasePred
+      alt.hit          := meta.hasAlt
+      alt.hitWayMaskOH := Mux(meta.hasAlt, UIntToOH(meta.altWayIdx, MaxNumWays), 0.U)
+      alt.tag          := t2_rawTag(meta.altTableIdx) ^ position
+      alt.takenCtr     := meta.altTakenCtr
+      // Alternate training never writes useful SRAM. Its useful counter is unavailable on the meta path.
+      alt.usefulCtr := UsefulCounter.Zero
     }.otherwise { // use result from sram read resp
       hasProvider     := hitTableMask.reduce(_ || _)
       providerTableOH := getLongestHistTableOH(hitTableMask).asUInt
@@ -372,11 +410,15 @@ class Tage(implicit p: Parameters) extends BasePredictor with HasTageParameters 
       hasAlt     := hasProvider && hitTableMaskNoProvider.reduce(_ || _)
       altTableOH := getLongestHistTableOH(hitTableMaskNoProvider).asUInt
       alt        := Mux1H(altTableOH, allTableTagMatchResults)
-
-      useProvider   := hasProvider && (!useAltOnNa || !provider.takenCtr.isWeak)
-      useAlt        := !useProvider && hasAlt
-      altOrBasePred := Mux(hasAlt, alt.takenCtr.isPositive, t2_basePred(i))
     }
+
+    // MainBTB meta already stores the prediction-time base counter, including VBTB results.
+    altOrBasePred := Mux(hasAlt, alt.takenCtr.isPositive, t2_baseCtr(i).isPositive)
+    val altConf       = Mux(hasAlt, !alt.takenCtr.isWeak, t2_baseCtr(i).isSaturate)
+    val useAltOnNaIdx = Cat(OHToUInt(providerTableOH), altConf)
+    val useAltOnNa    = useAltOnNaVec(useAltOnNaIdx).isPositive
+    useProvider := Mux(t2_useMeta, meta.useProvider, hasProvider && !(useAltOnNa && provider.takenCtr.isWeak))
+    useAlt      := !useProvider && hasAlt
 
     val providerPred = provider.takenCtr.isPositive
     val finalPred    = Mux(useProvider, providerPred, altOrBasePred)
@@ -399,8 +441,11 @@ class Tage(implicit p: Parameters) extends BasePredictor with HasTageParameters 
 
     val needUpdateAltCtr = !alt.takenCtr.shouldHold(actualTaken) && useAlt
 
-    val incUseAltOnNa = hasProvider && provider.takenCtr.isWeak && altOrBasePred === actualTaken
-    val decUseAltOnNa = hasProvider && provider.takenCtr.isWeak && altOrBasePred =/= actualTaken
+    // Train the selector only when it can change the prediction.
+    // When the weak provider and alternate/base disagree, exactly one of them is correct.
+    val trainUseAltOnNa = hasProvider && provider.takenCtr.isWeak && providerPred =/= altOrBasePred
+    val incUseAltOnNa   = trainUseAltOnNa && altOrBasePred === actualTaken
+    val decUseAltOnNa   = trainUseAltOnNa && providerPred === actualTaken
 
     val trainInfo = Wire(new TrainInfo).suggestName(s"t2_branch_${i}_trainInfo")
     trainInfo.valid := isCond && mbtbHit // Only consider update if conditional branch
@@ -431,6 +476,7 @@ class Tage(implicit p: Parameters) extends BasePredictor with HasTageParameters 
 
     trainInfo.incUseAltOnNa := incUseAltOnNa
     trainInfo.decUseAltOnNa := decUseAltOnNa
+    trainInfo.useAltOnNaIdx := useAltOnNaIdx
 
     trainInfo.finalPred   := finalPred
     trainInfo.actualTaken := actualTaken
@@ -447,17 +493,16 @@ class Tage(implicit p: Parameters) extends BasePredictor with HasTageParameters 
      - allocate a new entry when mispredict
      -------------------------------------------------------------------------------------------------------------- */
 
-  private val t3_fire                = RegNext(t2_fire, init = false.B)
-  private val t3_branches            = RegEnable(t2_branches, t2_fire)
-  private val t3_startPc             = RegEnable(t2_startPc, t2_fire)
-  private val t3_setIdx              = RegEnable(t2_setIdx, t2_fire)
-  private val t3_bankMask            = RegEnable(t2_bankMask, t2_fire)
-  private val t3_rawTag              = RegEnable(t2_rawTag, t2_fire)
-  private val t3_readResp            = RegEnable(t2_readResp, t2_fire)
-  private val t3_useMeta             = RegEnable(t2_useMeta, t2_fire)
-  private val t3_mbtbHitMask         = RegEnable(t2_mbtbHitMask, t2_fire)
-  private val t3_cfiUseAltOnNaIdxVec = RegEnable(t2_cfiUseAltOnNaIdxVec, t2_fire)
-  private val t3_trainInfoVec        = RegEnable(t2_trainInfoVec, t2_fire)
+  private val t3_fire         = RegNext(t2_fire, init = false.B)
+  private val t3_branches     = RegEnable(t2_branches, t2_fire)
+  private val t3_startPc      = RegEnable(t2_startPc, t2_fire)
+  private val t3_setIdx       = RegEnable(t2_setIdx, t2_fire)
+  private val t3_bankMask     = RegEnable(t2_bankMask, t2_fire)
+  private val t3_rawTag       = RegEnable(t2_rawTag, t2_fire)
+  private val t3_readResp     = RegEnable(t2_readResp, t2_fire)
+  private val t3_useMeta      = RegEnable(t2_useMeta, t2_fire)
+  private val t3_mbtbHitMask  = RegEnable(t2_mbtbHitMask, t2_fire)
+  private val t3_trainInfoVec = RegEnable(t2_trainInfoVec, t2_fire)
 
   private val t3_needAllocateBranchOH = t3_trainInfoVec.map(info => info.valid && info.needAllocate)
   when(t3_fire) {
@@ -497,7 +542,20 @@ class Tage(implicit p: Parameters) extends BasePredictor with HasTageParameters 
   private val t3_canAllocate          = t3_canAllocateTableMask.orR
   private val t3_allocate             = t3_needAllocate && t3_canAllocate
 
-  private val t3_allocateTableOH = PriorityEncoderOH(t3_canAllocateTableMask)
+  // Keep a 15-bit maximal-period LFSR (period 2^15 - 1) even though only the low NumTables bits are used.
+  // The longer period avoids short-period correlation with allocation/training events at negligible hardware cost.
+  // Its taps are {15, 14}, requiring only one feedback XOR; a shorter 8-bit maximal-period LFSR uses four taps.
+  // Randomly filter allocation candidates, then prefer the shorter-history table among the remaining candidates.
+  // Fall back to the original candidate mask when the random mask filters out every candidate.
+  require(NumTables <= 15, s"TAGE NumTables ($NumTables) must be less than the 15-bit LFSR width")
+  private val t3_allocateTableRandomMask    = random.LFSR(width = 15)(NumTables - 1, 0)
+  private val t3_randomCanAllocateTableMask = t3_canAllocateTableMask & t3_allocateTableRandomMask
+  private val t3_preferredAllocateTableMask = Mux(
+    t3_randomCanAllocateTableMask.orR,
+    t3_randomCanAllocateTableMask,
+    t3_canAllocateTableMask
+  )
+  private val t3_allocateTableOH = PriorityEncoderOH(t3_preferredAllocateTableMask)
   private val t3_allocateWayMask = Mux1H(t3_allocateTableOH, t3_allTableCanAllocateWayMask)
   private val t3_allocateWayOH   = PriorityEncoderOH(t3_allocateWayMask)
   dontTouch(t3_allocateTableOH)
@@ -557,7 +615,6 @@ class Tage(implicit p: Parameters) extends BasePredictor with HasTageParameters 
 
       val updateEn                = hitProvider || hitAlt
       val updateEntry             = Mux(hitProvider, providerInfo.providerEntry, altInfo.altEntry)
-      val updateUsefulCtr         = Mux(hitProvider, providerInfo.providerNewUsefulCtr, altInfo.altOldUsefulCtr)
       val updateBranchActualTaken = Mux(hitProvider, providerInfo.actualTaken, altInfo.actualTaken)
 
       val allocateEn = t3_allocate && t3_allocateTableOH(tableIdx) && t3_allocateWayOH(wayIdx)
@@ -566,13 +623,13 @@ class Tage(implicit p: Parameters) extends BasePredictor with HasTageParameters 
       writeEntryEn(wayIdx)    := providerWriteCtr.reduce(_ || _) || hitAlt || allocateEn
       writeUsefulEn(wayIdx)   := providerWriteUseful.reduce(_ || _) || allocateEn
       writeEntries(wayIdx)    := Mux(allocateEn, t3_allocateEntry, updateEntry)
-      writeUsefulCtrs(wayIdx) := Mux(allocateEn, UsefulCounter.Init, updateUsefulCtr)
+      writeUsefulCtrs(wayIdx) := Mux(allocateEn, UsefulCounter.Init, providerInfo.providerNewUsefulCtr)
       actualTakenMask(wayIdx) := Mux(allocateEn, t3_allocateBranch.bits.taken, updateBranchActualTaken)
     }
 
     table.io.writeReq.valid                := t3_fire && writeWayMask.reduce(_ || _)
     table.io.writeReq.bits.setIdx          := t3_setIdx(tableIdx)
-    table.io.writeReq.bits.bankMask        := t3_bankMask
+    table.io.writeReq.bits.bankMask        := t3_bankMask(tableIdx)
     table.io.writeReq.bits.wayMask         := writeWayMask.asUInt
     table.io.writeReq.bits.writeEntryEn    := writeEntryEn
     table.io.writeReq.bits.writeUsefulEn   := writeUsefulEn
@@ -595,27 +652,26 @@ class Tage(implicit p: Parameters) extends BasePredictor with HasTageParameters 
     usefulResetCtr.selfIncrease()
   }
 
-  useAltOnNaVec.zipWithIndex.map { case (ctr, i) =>
-    val idxMatchMask = t3_cfiUseAltOnNaIdxVec.map(_ === i.U)
+  useAltOnNaVec.zipWithIndex.foreach { case (ctr, i) =>
+    val idxMatchMask = t3_trainInfoVec.map(updateInfo => updateInfo.valid && updateInfo.useAltOnNaIdx === i.U)
     val increaseMask = idxMatchMask.zip(t3_trainInfoVec).map { case (idxMatch, updateInfo) =>
-      idxMatch && updateInfo.valid && updateInfo.incUseAltOnNa
+      idxMatch && updateInfo.incUseAltOnNa
     }
     val decreaseMask = idxMatchMask.zip(t3_trainInfoVec).map { case (idxMatch, updateInfo) =>
-      idxMatch && updateInfo.valid && updateInfo.decUseAltOnNa
+      idxMatch && updateInfo.decUseAltOnNa
     }
-    val increase = increaseMask.reduce(_ || _)
-    val decrease = decreaseMask.reduce(_ || _)
+    val increaseCount = PopCount(increaseMask)
+    val decreaseCount = PopCount(decreaseMask)
+    val increase      = increaseCount >= decreaseCount
+    val step          = Mux(increase, increaseCount - decreaseCount, decreaseCount - increaseCount)
+    val updatedCtr = Mux(
+      increase,
+      ctr.getIncrease(step, en = step.orR),
+      ctr.getDecrease(step, en = step.orR)
+    )
 
     when(t3_fire) {
-      assert(PopCount(increaseMask) <= 1.U)
-      assert(PopCount(decreaseMask) <= 1.U)
-      assert(!(increase && decrease))
-
-      when(increase) {
-        ctr.selfIncrease()
-      }.elsewhen(decrease) {
-        ctr.selfDecrease()
-      }
+      ctr := updatedCtr
     }
   }
 
@@ -682,9 +738,22 @@ class Tage(implicit p: Parameters) extends BasePredictor with HasTageParameters 
       Mux(io.stageCtrl.s2_fire, PopCount(condMask), 0.U)
     }
   )
+  XSPerfAccumulate(
+    "fast_final_prediction_mismatch", {
+      val mismatchMask = s2_branches.zipWithIndex.map { case (branch, i) =>
+        val fastTaken  = Mux(io.prediction.fastTakenVec(i).valid, io.prediction.fastTakenVec(i).bits, branch.bits.taken)
+        val finalTaken = Mux(io.prediction.takenVec(i).valid, io.prediction.takenVec(i).bits, branch.bits.taken)
+        branch.valid && branch.bits.attribute.isConditional && fastTaken =/= finalTaken
+      }
+      Mux(s2_fire, PopCount(mismatchMask), 0.U)
+    }
+  )
   XSPerfAccumulate("total_train", io.stageCtrl.t0_fire)
   XSPerfAccumulate("train_has_cond", t0_fire)
+  XSPerfAccumulate("total_train_read", t0_fire && t0_needRead)
+  XSPerfAccumulate("both_read", s0_fire && io.debug_trainValid && t0_needRead)
   XSPerfAccumulate("read_conflict", debug_readBankConflict)
+  XSPerfAccumulate("read_no_conflict", debug_readBankNoConflict)
   XSPerfAccumulate("reset_useful", t3_usefulResetStart)
   XSPerfAccumulate(
     "allocate_not_needed_due_to_already_on_highest_table", {

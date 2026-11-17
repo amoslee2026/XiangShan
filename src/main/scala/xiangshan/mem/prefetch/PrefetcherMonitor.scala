@@ -6,9 +6,9 @@ import chisel3.util._
 import utils._
 import utility._
 import xiangshan._
+import xiangshan.backend.rob.Rob.RobDebugRollingIO
 import xiangshan.mem.L1PrefetchReq
 import xiangshan.mem.HasL1PrefetchSourceParameter
-import xiangshan.backend.rob.RobDebugRollingIO
 
 class PrefetchControlBundle()(implicit p: Parameters) extends XSBundle with HasStreamPrefetchHelper {
   val dynamic_depth = UInt(DEPTH_BITS.W)
@@ -82,9 +82,9 @@ class PrefetcherMonitor()(implicit p: Parameters) extends XSModule with HasStrea
   val StrideMonitor = Module(new L1PrefetchMonitor(PrefetcherMonitorParam.fromString("stride")))
   val BertiMonitor = Module(new L1PrefetchMonitor(PrefetcherMonitorParam.fromString("berti")))
 
-  StreamMonitor.io.prefetch_info:= prefetch_info
-  StrideMonitor.io.prefetch_info := prefetch_info
-  BertiMonitor.io.prefetch_info := prefetch_info
+  StreamMonitor.io.prefetch_info:= RegNext(prefetch_info)
+  StrideMonitor.io.prefetch_info := RegNext(prefetch_info)
+  BertiMonitor.io.prefetch_info := RegNext(prefetch_info)
   
   // stream 0, stride 1
   io.pf_ctrl(0) := StreamMonitor.io.pf_ctrl

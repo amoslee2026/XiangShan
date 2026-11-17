@@ -133,7 +133,8 @@ class LoadQueueRAR(implicit p: Parameters) extends XSModule
   val release1Cycle = io.release
   // val release2Cycle = RegNext(io.release)
   // val release2Cycle_dup_lsu = RegNext(io.release)
-  val release2Cycle = RegEnable(io.release, io.release.valid)
+  val release2Cycle = Wire(io.release.cloneType)
+  release2Cycle.bits := RegEnable(io.release.bits, io.release.valid)
   release2Cycle.valid := RegNext(io.release.valid)
   //val release2Cycle_dup_lsu = RegEnable(io.release, io.release.valid)
 
@@ -247,7 +248,7 @@ class LoadQueueRAR(implicit p: Parameters) extends XSModule
 
     query.resp.valid := RegNext(query.req.valid)
     // Generate real violation mask
-    val robIdxMask = VecInit(uop.map(_.robIdx).map(isAfter(_, query.req.bits.robIdx)))
+    val robIdxMask = VecInit(uop.map(_.robIdx).map(_.isAfterSlot(query.req.bits.robIdx)))
     val matchMaskReg = Wire(Vec(LoadQueueRARSize, Bool()))
     for(i <- 0 until LoadQueueRARSize) {
       matchMaskReg(i) := (allocated(i) &
@@ -255,7 +256,7 @@ class LoadQueueRAR(implicit p: Parameters) extends XSModule
                          robIdxMask(i) &&
                          released(i))
       }
-    val matchMask = GatedValidRegNext(matchMaskReg)
+    val matchMask = RegEnable(matchMaskReg, query.req.valid)
     //  Load-to-Load violation check result
     val ldLdViolationMask = matchMask
     ldLdViolationMask.suggestName("ldLdViolationMask_" + w)
@@ -277,7 +278,13 @@ class LoadQueueRAR(implicit p: Parameters) extends XSModule
     }
   })
 
-  io.lqFull := freeList.io.empty
+  // Unaligned replay may allocate one RAR entry for the head and another one
+  // for the tail. Do not wake C_RAR replays when the queue only has a few
+  // slots left; otherwise the head can consume the last slots and the paired
+  // tail immediately nacks, causing the same replay to spin.
+  val freeEntryCount = LoadQueueRARSize.U - freeList.io.validCount
+  val hasEnoughReplayEntries = freeEntryCount >= (2 * LoadPipelineWidth).U
+  io.lqFull := !hasEnoughReplayEntries
   io.validCount := freeList.io.validCount
 
   // perf cnt

@@ -24,7 +24,7 @@ import utility.XSDebug
 import utility.XSPerfAccumulate
 import utility.mbist.MbistPipeline
 import utility.sram.FoldedSRAMTemplate
-import xiangshan.frontend.PrunedAddr
+import xiangshan.frontend.Pc
 import xiangshan.frontend.bpu.FoldedHistoryInfo
 import xiangshan.frontend.bpu.IttageTableInfo
 import xiangshan.frontend.bpu.SaturateCounter
@@ -41,7 +41,7 @@ class IttageTable(
 
   class IttageTableIO extends IttageBundle {
     class Req extends Bundle {
-      val startPc:    PrunedAddr            = PrunedAddr(VAddrBits)
+      val startPc:    Pc                    = Pc()
       val foldedHist: PhrAllFoldedHistories = new PhrAllFoldedHistories(AllFoldedHistoryInfo)
     }
 
@@ -52,7 +52,7 @@ class IttageTable(
     }
 
     class Update extends Bundle {
-      val startPc:    PrunedAddr            = PrunedAddr(VAddrBits)
+      val startPc:    Pc                    = Pc()
       val foldedHist: PhrAllFoldedHistories = new PhrAllFoldedHistories(AllFoldedHistoryInfo)
       // update tag and ctr
       val valid:   Bool            = Bool()
@@ -115,7 +115,7 @@ class IttageTable(
   require(ittageEntrySz == (new IttageEntry(tagLen)).getWidth)
 
   // pc is start address of basic block, most 2 branch inst in block
-  def getUnhashedIdx(pc: PrunedAddr): UInt = (pc >> instOffsetBits).asUInt
+  def getUnhashedIdx(pc: Pc): UInt = (pc >> instOffsetBits).asUInt
 
   private val s0_valid       = io.req.valid
   private val s0_startPc     = io.req.bits.startPc
@@ -176,9 +176,11 @@ class IttageTable(
 
   private val updateAllBitmask = VecInit.fill(ittageEntrySz)(1.U).asUInt // update all entry
   private val updateNoBitmask  = VecInit.fill(ittageEntrySz)(0.U).asUInt // update no
-  private val updateNoUsBitmask =
-    VecInit.tabulate(ittageEntrySz)(_.U >= UsefulCntWidth.U).asUInt // update others besides useful bit
-  private val updateUsBitmask = VecInit.tabulate(ittageEntrySz)(_.U < UsefulCntWidth.U).asUInt // update useful bit
+  // Build the mask through the entry field itself so it follows the Bundle's actual layout.
+  private val usefulMaskEntry = WireInit(0.U.asTypeOf(new IttageEntry(tagLen)))
+  usefulMaskEntry.usefulCnt := UsefulCounter.SaturatePositive
+  private val updateUsefulBitmask       = usefulMaskEntry.asUInt
+  private val updateExceptUsefulBitmask = ~updateUsefulBitmask
 
   private val needReset      = RegInit(false.B)
   private val usefulCanReset = !(io.req.fire || io.update.valid) && needReset
@@ -192,7 +194,7 @@ class IttageTable(
   private val updateBitmask = Mux(
     io.update.usefulCntValid && io.update.valid,
     updateAllBitmask,
-    Mux(io.update.valid, updateNoUsBitmask, Mux(usefulCanReset, updateUsBitmask, updateNoBitmask))
+    Mux(io.update.valid, updateExceptUsefulBitmask, Mux(usefulCanReset, updateUsefulBitmask, updateNoBitmask))
   )
 
   /**
@@ -271,11 +273,11 @@ class IttageTable(
       bank.io.r.req.valid && buffer.io.read.head.valid
     }).asUInt.orR
   )
-  private val targetBankReady = writeBuffers
+  private val updateOverwrite = writeBuffers
     .zip(updateBankMask.asBools)
-    .map { case (buffer, sel) => buffer.io.write.head.ready && sel }
+    .map { case (buffer, sel) => buffer.io.overwrite.head && sel }
     .reduce(_ || _)
-  XSPerfAccumulate("ittage_table_update_drop", io.update.valid && !targetBankReady)
+  XSPerfAccumulate("ittage_table_update_overwrite", io.update.valid && updateOverwrite)
 
   if (debug) {
     val u    = io.update

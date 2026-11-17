@@ -21,6 +21,7 @@ import org.chipsalliance.cde.config.Parameters
 import utility.DataHoldBypass
 import utility.ValidHold
 import utility.XSPerfAccumulate
+import utility.XSPerfSeqAccumulate
 import utils.EnumUInt
 import xiangshan.cache.mmu.Pbmt
 import xiangshan.cache.mmu.TlbCmd
@@ -85,16 +86,24 @@ class ICachePrefetchPipe(implicit p: Parameters) extends ICacheModule
     */
   private val s0_req              = io.fromFtq.bits.req
   private val s0_ftqIdx           = s0_req(0).ftqIdx
-  private val s0_isSoftPrefetch   = s0_req(0).isSoftPrefetch
   private val s0_backendException = s0_req(0).backendException
   private val s0_twoPrefetchCase  = io.fromFtq.bits.twoPrefetchCase
 
+  assert(
+    !s0_valid || !s0_twoPrefetchCase.valid ||
+      !(!s0_req(0).source.inStream && s0_req(1).source.inStream),
+    "req(1) can be inStream only when req(0) is inStream"
+  )
+
   private val s0_readMetaVAddr  = s0_twoPrefetchCase.selectMetaVAddr(s0_req)
-  private val s0_readMetaSetIdx = VecInit(s0_readMetaVAddr.map(get_idx))
+  private val s0_readMetaSetIdx = s0_twoPrefetchCase.selectMetaSetIdx(s0_req)
   private val s0_readDoubleLine = s0_twoPrefetchCase.selectIsCrossLine(s0_req)
 
-  fromBpuS0Flush := !s0_isSoftPrefetch && io.flushFromBpu.shouldFlushByStage3(s0_ftqIdx, s0_valid)
-  s0_flush       := io.flush || fromBpuS0Flush || s1_flush
+  // TODO: do not flush if req(1).source is not inStream
+  fromBpuS0Flush := s0_req.head.source.inStream &&
+    (io.flushFromBpu.shouldFlushByStage2(s0_ftqIdx, s0_valid) ||
+      io.flushFromBpu.shouldFlushByStage3(s0_ftqIdx, s0_valid))
+  s0_flush := io.flush || fromBpuS0Flush || s1_flush
 
   io.fromFtq.ready := s1_ready && toItlb.ready && toMeta.ready && !s0_flush
 
@@ -112,7 +121,6 @@ class ICachePrefetchPipe(implicit p: Parameters) extends ICacheModule
   private val s1_valid = ValidHold(s0_fire, s1_fire, s1_flush)
 
   private val s1_req              = RegEnable(s0_req, 0.U.asTypeOf(s0_req), s0_fire)
-  private val s1_isSoftPrefetch   = RegEnable(s0_isSoftPrefetch, 0.U.asTypeOf(s0_isSoftPrefetch), s0_fire)
   private val s1_ftqIdx           = RegEnable(s0_ftqIdx, 0.U.asTypeOf(s0_ftqIdx), s0_fire)
   private val s1_backendException = RegEnable(s0_backendException, 0.U.asTypeOf(s0_backendException), s0_fire)
 
@@ -158,13 +166,18 @@ class ICachePrefetchPipe(implicit p: Parameters) extends ICacheModule
   // NOTE: in kunminghu-v3, Bpu/Ftq ensure that a single fetch request will not cross page,
   //       so we need only one Itlb port to get pAddr / itlbException,
   //       and we can simply use vAddr of first cacheline to send Itlb request.
+  private val itlbVAddr  = Mux(s1_needItlb, s1_readMetaVAddr(0), s0_readMetaVAddr(0))
+  private val itlbFullVa = itlbVAddr.signExt(XLEN).toUInt
+
   toItlb.valid             := s1_needItlb || s0_valid
   toItlb.bits              := DontCare
   toItlb.bits.size         := 3.U
-  toItlb.bits.vaddr        := Mux(s1_needItlb, s1_readMetaVAddr(0).toUInt, s0_readMetaVAddr(0).toUInt)
-  toItlb.bits.debug.pc     := Mux(s1_needItlb, s1_readMetaVAddr(0).toUInt, s0_readMetaVAddr(0).toUInt)
+  toItlb.bits.vaddr        := itlbVAddr.toUInt(VAddrBits - 1, 0)
+  toItlb.bits.debug.pc     := itlbFullVa
   toItlb.bits.cmd          := TlbCmd.exec
   toItlb.bits.no_translate := false.B
+  toItlb.bits.fullva       := itlbFullVa
+  toItlb.bits.checkfullva  := true.B
   fromItlb.ready           := true.B
   io.itlb.req_kill         := false.B
 
@@ -298,8 +311,8 @@ class ICachePrefetchPipe(implicit p: Parameters) extends ICacheModule
         !fromMiss.valid &&
         // pipeline is not being flushed
         !s1_flush &&
-        // do not send soft prefetch to waylookup/mainpipe, as it does not affect control flow
-        !s1_isSoftPrefetch &&
+        // enqueue only inStream requests (otherwise is softPrefetch or TODO, which should not affect control flow)
+        s1_req(i).source.inStream &&
         // first port is always valid, the second port is valid only if we can do 2-prefetch
         (if (i == 0) true.B else s1_twoPrefetchCase.valid)
 
@@ -317,7 +330,7 @@ class ICachePrefetchPipe(implicit p: Parameters) extends ICacheModule
     port.bits.exceptionEntry.isForVSnonLeafPTE := s1_isForVSnonLeafPTE
 
     port.bits.entry.debug_ftqIdx.foreach(_ := s1_req(i).ftqIdx)
-    port.bits.entry.debug_startVAddr.foreach(_ := s1_req(i).startVAddr)
+    port.bits.entry.debug_startVAddr.foreach(_ := s1_req(i).startVAddr.unGuard)
 
     when(port.fire) {
       val waymasksVec = s1_reqMetaInfo(i).map(_.waymask.asTypeOf(Vec(nWays, Bool())))
@@ -388,7 +401,7 @@ class ICachePrefetchPipe(implicit p: Parameters) extends ICacheModule
       } // .otherwise { s1_nextState := S1FsmState.metaResend }  // !toMeta.ready
     }
     is(S1FsmState.EnqWay) {
-      when(toWayLookup.head.fire || s1_isSoftPrefetch) {
+      when(toWayLookup.head.fire || !s1_req.head.source.inStream) {
         when(!s2_ready) {
           s1_nextState := S1FsmState.EnterS2
         }.otherwise { // s2_ready
@@ -408,7 +421,7 @@ class ICachePrefetchPipe(implicit p: Parameters) extends ICacheModule
   }
 
   /** Stage 1 control */
-  fromBpuS1Flush := !s1_isSoftPrefetch && io.flushFromBpu.shouldFlushByStage3(s1_ftqIdx, s1_valid)
+  fromBpuS1Flush := s1_req.head.source.inStream && io.flushFromBpu.shouldFlushByStage3(s1_ftqIdx, s1_valid)
   s1_flush       := io.flush || fromBpuS1Flush
   // when s1 is flushed, itlb pipeline should also be flushed
   io.itlbFlushPipe := s1_flush
@@ -426,9 +439,9 @@ class ICachePrefetchPipe(implicit p: Parameters) extends ICacheModule
     */
   private val s2_valid = ValidHold(s1_realFire, s2_fire, s2_flush)
 
-  private val s2_isSoftPrefetch = RegEnable(s1_isSoftPrefetch, 0.U.asTypeOf(s1_isSoftPrefetch), s1_realFire)
-  private val s2_doubleline     = RegEnable(s1_readDoubleLine, 0.U.asTypeOf(s1_readDoubleLine), s1_realFire)
-  private val s2_pTag           = RegEnable(s1_pTag, 0.U.asTypeOf(s1_pTag), s1_realFire)
+  private val s2_source     = RegEnable(s1_req.head.source, 0.U.asTypeOf(s1_req.head.source), s1_realFire)
+  private val s2_doubleline = RegEnable(s1_readDoubleLine, 0.U.asTypeOf(s1_readDoubleLine), s1_realFire)
+  private val s2_pTag       = RegEnable(s1_pTag, 0.U.asTypeOf(s1_pTag), s1_realFire)
   private val s2_exception =
     RegEnable(s1_exceptionOut, 0.U.asTypeOf(s1_exceptionOut), s1_realFire) // includes itlb/pmp exception
   private val s2_isMmio         = RegEnable(s1_isMmio, 0.U.asTypeOf(s1_isMmio), s1_realFire)
@@ -504,12 +517,22 @@ class ICachePrefetchPipe(implicit p: Parameters) extends ICacheModule
   // the number of bpu flush
   XSPerfAccumulate("bpuS0Flush", fromBpuS0Flush)
   XSPerfAccumulate("bpuS1Flush", fromBpuS1Flush)
-  // the number of prefetch request received from ftq or backend (software prefetch)
-  XSPerfAccumulate("hwReq", io.fromFtq.fire && !io.fromFtq.bits.req(0).isSoftPrefetch) // FIXME
-  XSPerfAccumulate("swReq", io.fromFtq.fire && io.fromFtq.bits.req(0).isSoftPrefetch)
+  // the number of prefetch request received
+  (0 until MaxPrefetchReqNum).foreach(i =>
+    XSPerfSeqAccumulate(
+      s"req$i",
+      io.fromFtq.fire && (if (i == 0) true.B else io.fromFtq.bits.twoPrefetchCase.valid),
+      io.fromFtq.bits.req(i).source.getValidSeq
+    )
+  )
   // the number of prefetch request sent to missUnit
-  XSPerfAccumulate("hwMiss", toMiss.fire && !s2_isSoftPrefetch)
-  XSPerfAccumulate("swMiss", toMiss.fire && s2_isSoftPrefetch)
+  XSPerfSeqAccumulate(
+    "miss",
+    toMiss.fire,
+    s2_source.getValidSeq
+  )
+
+  /* *** stall reason *** */
   XSPerfAccumulate("stallCycles_fetch_icachePrefetch_missUnit", toMiss.valid && !toMiss.ready)
 
   // itlb miss bubble
