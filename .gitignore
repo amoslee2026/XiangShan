@@ -383,3 +383,6 @@ bug-report.tar.gz
 .venv/
 venv/
 .serena/
+
+# millw launcher temp downloads (mktemp mill.XXXXXX in repo root)
+/mill.*
